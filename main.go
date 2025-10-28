@@ -53,7 +53,7 @@ type Config struct {
 var cfg = Config{
 	ListenAddr:     ":8080",
 	MaxHops:        30,
-	Count:          5,
+	Count:          3,
 	TimeoutMS:      1000,
 	GeoASNPath:     "./GeoLite2-ASN.mmdb",
 	GeoCityPath:    "./GeoLite2-City.mmdb",
@@ -117,6 +117,7 @@ func (g *GeoDB) Lookup(ip net.IP) (geo string, as string) {
 	if ip == nil {
 		return "--", "--"
 	}
+
 	// ASN
 	if g.asn != nil {
 		if rec, err := g.asn.ASN(ip); err == nil && rec != nil && rec.AutonomousSystemNumber != 0 {
@@ -124,6 +125,7 @@ func (g *GeoDB) Lookup(ip net.IP) (geo string, as string) {
 			as = fmt.Sprintf("AS%d %s", rec.AutonomousSystemNumber, asName)
 		}
 	}
+
 	// City / Country
 	countryName := ""
 	cityName := ""
@@ -154,6 +156,7 @@ func (g *GeoDB) Lookup(ip net.IP) (geo string, as string) {
 			}
 		}
 	}
+
 	if countryName == "" && cityName == "" {
 		geo = "--"
 	} else if countryName != "" && cityName != "" {
@@ -161,6 +164,7 @@ func (g *GeoDB) Lookup(ip net.IP) (geo string, as string) {
 	} else {
 		geo = countryName + cityName
 	}
+
 	if as == "" {
 		as = "--"
 	}
@@ -203,68 +207,8 @@ type ProbeResult struct {
 	Seq      int
 	IP       string
 	RTT      time.Duration
-	Type     string // "ttl-exceeded", "destination", "echo-reply", "tcp-reply"
+	Type     string
 	Received bool
-}
-
-// =================== Probe Manager ===================
-
-type ProbeManager struct {
-	probes map[string]*ProbeInfo // key: "ttl:seq" or port for TCP/UDP
-	mu     sync.RWMutex
-}
-
-type ProbeInfo struct {
-	TTL       int
-	Seq       int
-	Port      uint16
-	StartTime time.Time
-}
-
-func NewProbeManager() *ProbeManager {
-	return &ProbeManager{
-		probes: make(map[string]*ProbeInfo),
-	}
-}
-
-func (pm *ProbeManager) Register(ttl, seq int, port uint16) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	key := fmt.Sprintf("%d:%d", ttl, seq)
-	if port > 0 {
-		key = fmt.Sprintf("port:%d", port)
-	}
-	pm.probes[key] = &ProbeInfo{
-		TTL:       ttl,
-		Seq:       seq,
-		Port:      port,
-		StartTime: time.Now(),
-	}
-}
-
-func (pm *ProbeManager) Match(ttl, seq int, port uint16) (*ProbeInfo, bool) {
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-	key := fmt.Sprintf("%d:%d", ttl, seq)
-	if port > 0 {
-		key = fmt.Sprintf("port:%d", port)
-	}
-	info, ok := pm.probes[key]
-	return info, ok
-}
-
-func (pm *ProbeManager) Clean(before time.Time) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	for k, v := range pm.probes {
-		if v.StartTime.Before(before) {
-			delete(pm.probes, k)
-		}
-	}
-}
-
-func isRoot() bool {
-	return os.Geteuid() == 0
 }
 
 // =================== HTTP ===================
@@ -287,6 +231,10 @@ func main() {
 }
 
 var geoDB GeoDB
+
+func isRoot() bool {
+	return os.Geteuid() == 0
+}
 
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	_ = tplIndexParsed.Execute(w, map[string]any{
@@ -360,6 +308,7 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 			emitEvent(w, map[string]any{"type": "error", "msg": err.Error()})
 		}
 	}()
+
 	emitEvent(w, map[string]any{"type": "start", "target": target, "mode": params.Mode, "dport": params.DPort})
 	for hop := range ch {
 		emitEvent(w, map[string]any{"type": "hop", "data": hop})
@@ -399,7 +348,6 @@ func doTrace(ctx context.Context, p TraceParams, out chan<- HopStat) error {
 	if err != nil {
 		return fmt.Errorf("resolve %s: %w", p.Target, err)
 	}
-	//is6 := ipaddr.IP.To4() == nil
 
 	switch p.Mode {
 	case ModeICMP:
@@ -422,6 +370,7 @@ func resolveBestIP(ctx context.Context, host string) (*net.IPAddr, error) {
 	if err != nil || len(ips) == 0 {
 		return nil, err
 	}
+	// 优先返回 IPv4
 	for _, ip := range ips {
 		if ip.To4() != nil {
 			return &net.IPAddr{IP: ip}, nil
@@ -451,21 +400,6 @@ func traceICMP(ctx context.Context, dst *net.IPAddr, count, timeoutMS, maxHops i
 	defer c.Close()
 
 	pid := os.Getpid() & 0xffff
-	pm := NewProbeManager()
-
-	// 定期清理过期探测记录
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				pm.Clean(time.Now().Add(-10 * time.Second))
-			}
-		}
-	}()
 
 	for ttl := 1; ttl <= maxHops; ttl++ {
 		select {
@@ -480,28 +414,19 @@ func traceICMP(ctx context.Context, dst *net.IPAddr, count, timeoutMS, maxHops i
 
 		for i := 0; i < count; i++ {
 			seq := ttl*1000 + i
-			pm.Register(ttl, seq, 0)
 
 			var msg icmp.Message
 			if is6 {
 				msg = icmp.Message{
 					Type: ipv6.ICMPTypeEchoRequest,
 					Code: 0,
-					Body: &icmp.Echo{
-						ID:   pid,
-						Seq:  seq,
-						Data: []byte("QwQTrace"),
-					},
+					Body: &icmp.Echo{ID: pid, Seq: seq, Data: []byte("QwQTrace")},
 				}
 			} else {
 				msg = icmp.Message{
 					Type: ipv4.ICMPTypeEcho,
 					Code: 0,
-					Body: &icmp.Echo{
-						ID:   pid,
-						Seq:  seq,
-						Data: []byte("QwQTrace"),
-					},
+					Body: &icmp.Echo{ID: pid, Seq: seq, Data: []byte("QwQTrace")},
 				}
 			}
 
@@ -509,15 +434,14 @@ func traceICMP(ctx context.Context, dst *net.IPAddr, count, timeoutMS, maxHops i
 
 			// 设置 TTL/HopLimit
 			if is6 {
-				p := c.IPv6PacketConn()
-				_ = p.SetHopLimit(ttl)
+				_ = c.IPv6PacketConn().SetHopLimit(ttl)
 			} else {
-				p := c.IPv4PacketConn()
-				_ = p.SetTTL(ttl)
+				_ = c.IPv4PacketConn().SetTTL(ttl)
 			}
 
 			start := time.Now()
 			if _, err := c.WriteTo(b, dst); err != nil {
+				results = append(results, ProbeResult{TTL: ttl, Seq: i, Received: false})
 				continue
 			}
 
@@ -529,7 +453,6 @@ func traceICMP(ctx context.Context, dst *net.IPAddr, count, timeoutMS, maxHops i
 				_ = c.SetReadDeadline(deadline)
 				buf := make([]byte, 1500)
 				n, peer, err := c.ReadFrom(buf)
-
 				if err != nil {
 					break
 				}
@@ -544,47 +467,23 @@ func traceICMP(ctx context.Context, dst *net.IPAddr, count, timeoutMS, maxHops i
 
 				switch rm.Type {
 				case ipv4.ICMPTypeEchoReply, ipv6.ICMPTypeEchoReply:
-					if body, ok := rm.Body.(*icmp.Echo); ok {
-						if body.ID == pid && body.Seq == seq {
-							results = append(results, ProbeResult{
-								TTL:      ttl,
-								Seq:      seq,
-								IP:       peerIP,
-								RTT:      rtt,
-								Type:     "echo-reply",
-								Received: true,
-							})
-							hopIPs[peerIP]++
-							hop.Reachable = true
-							received = true
-						}
+					if body, ok := rm.Body.(*icmp.Echo); ok && body.ID == pid && body.Seq == seq {
+						results = append(results, ProbeResult{TTL: ttl, Seq: i, IP: peerIP, RTT: rtt, Type: "echo-reply", Received: true})
+						hopIPs[peerIP]++
+						hop.Reachable = true
+						received = true
 					}
 
 				case ipv4.ICMPTypeTimeExceeded, ipv6.ICMPTypeTimeExceeded:
-					// 解析原始包来验证是否是我们的探测
 					if validateICMPResponse(rm, pid, seq) {
-						results = append(results, ProbeResult{
-							TTL:      ttl,
-							Seq:      seq,
-							IP:       peerIP,
-							RTT:      rtt,
-							Type:     "ttl-exceeded",
-							Received: true,
-						})
+						results = append(results, ProbeResult{TTL: ttl, Seq: i, IP: peerIP, RTT: rtt, Type: "ttl-exceeded", Received: true})
 						hopIPs[peerIP]++
 						received = true
 					}
 
 				case ipv4.ICMPTypeDestinationUnreachable, ipv6.ICMPTypeDestinationUnreachable:
 					if validateICMPResponse(rm, pid, seq) {
-						results = append(results, ProbeResult{
-							TTL:      ttl,
-							Seq:      seq,
-							IP:       peerIP,
-							RTT:      rtt,
-							Type:     "destination",
-							Received: true,
-						})
+						results = append(results, ProbeResult{TTL: ttl, Seq: i, IP: peerIP, RTT: rtt, Type: "destination", Received: true})
 						hopIPs[peerIP]++
 						received = true
 					}
@@ -592,15 +491,10 @@ func traceICMP(ctx context.Context, dst *net.IPAddr, count, timeoutMS, maxHops i
 			}
 
 			if !received {
-				results = append(results, ProbeResult{
-					TTL:      ttl,
-					Seq:      seq,
-					Received: false,
-				})
+				results = append(results, ProbeResult{TTL: ttl, Seq: i, Received: false})
 			}
 		}
 
-		// 处理结果
 		processHopResults(&hop, results, hopIPs)
 
 		select {
@@ -609,22 +503,18 @@ func traceICMP(ctx context.Context, dst *net.IPAddr, count, timeoutMS, maxHops i
 			return ctx.Err()
 		}
 
-		if hop.Reachable && len(hop.IPs) > 0 && sameHost(hop.IPs[0], dst.String()) {
+		if hop.Reachable && len(hop.IPs) > 0 && normalizeIP(hop.IPs[0]) == normalizeIP(dst.IP.String()) {
 			break
 		}
 	}
 	return nil
 }
 
-// =================== UDP traceroute ===================
+// =================== UDP traceroute (标准实现) ===================
 
-var udpPortCounter uint32 = 33434
-
-// =================== UDP traceroute (完全修复版) ===================
 func traceUDP(ctx context.Context, dst *net.IPAddr, basePort uint16, count, timeoutMS, maxHops int, out chan<- HopStat) error {
 	is6 := dst.IP.To4() == nil
 
-	// 监听 ICMP 响应
 	var network string
 	var proto int
 	if is6 {
@@ -641,16 +531,9 @@ func traceUDP(ctx context.Context, dst *net.IPAddr, basePort uint16, count, time
 	}
 	defer icmpConn.Close()
 
-	// 使用基础端口
 	if basePort == 0 {
 		basePort = 33434
 	}
-
-	dstIPStr := dst.IP.String()
-
-	// 用于记录最后一个有效响应的跳数
-	lastValidHop := 0
-	consecutiveTimeouts := 0
 
 	for ttl := 1; ttl <= maxHops; ttl++ {
 		select {
@@ -661,133 +544,83 @@ func traceUDP(ctx context.Context, dst *net.IPAddr, basePort uint16, count, time
 
 		hop := HopStat{Hop: ttl, Sent: count}
 		hopIPs := make(map[string]int)
-		results := make([]ProbeResult, count)
-		receivedAny := false
+		var results []ProbeResult
 
 		for i := 0; i < count; i++ {
-			// 使用唯一端口
-			dport := basePort + uint16((ttl-1)*100+i)
-			if dport > 64000 {
-				dport = basePort + uint16(ttl*10+i)
+			// 标准 traceroute: 每次增加端口号
+			dport := basePort + uint16((ttl-1)*count+i)
+
+			// 创建 UDP 连接
+			conn, err := createUDPSocket(dst.IP.String(), dport, ttl, is6)
+			if err != nil {
+				results = append(results, ProbeResult{TTL: ttl, Seq: i, Received: false})
+				continue
 			}
 
-			// 发送UDP探测
-			conn, err := net.DialTimeout("udp",
-				fmt.Sprintf("%s:%d", dst.IP.String(), dport),
-				50*time.Millisecond)
+			// 发送数据
+			payload := []byte("QwQTrace")
+			startTime := time.Now()
+			_, err = conn.Write(payload)
+			conn.Close()
 
-			if err == nil {
-				// 设置TTL
-				if udpConn, ok := conn.(*net.UDPConn); ok {
-					raw, _ := udpConn.SyscallConn()
-					raw.Control(func(fd uintptr) {
-						if is6 {
-							syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_UNICAST_HOPS, ttl)
-						} else {
-							syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
-						}
-					})
+			if err != nil {
+				results = append(results, ProbeResult{TTL: ttl, Seq: i, Received: false})
+				continue
+			}
+
+			// 等待 ICMP 响应
+			deadline := time.Now().Add(time.Duration(timeoutMS) * time.Millisecond)
+			received := false
+
+			for time.Now().Before(deadline) && !received {
+				buf := make([]byte, 1500)
+				icmpConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+				n, peer, err := icmpConn.ReadFrom(buf)
+
+				if err != nil || n == 0 {
+					continue
 				}
 
-				// 发送数据
-				payload := make([]byte, 32)
-				copy(payload, "TRACE")
-				binary.BigEndian.PutUint16(payload[5:7], uint16(ttl))
-				binary.BigEndian.PutUint16(payload[7:9], uint16(i))
-				binary.BigEndian.PutUint16(payload[9:11], dport)
+				rm, err := icmp.ParseMessage(proto, buf[:n])
+				if err != nil {
+					continue
+				}
 
-				startTime := time.Now()
-				conn.Write(payload)
-				conn.Close()
-
-				// 等待ICMP响应
-				received := false
-				deadline := time.Now().Add(time.Duration(timeoutMS) * time.Millisecond)
-
-				for time.Now().Before(deadline) && !received {
-					buf := make([]byte, 1500)
-					icmpConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-					n, peer, err := icmpConn.ReadFrom(buf)
-
-					if err != nil || n == 0 {
-						continue
-					}
-
-					rm, err := icmp.ParseMessage(proto, buf[:n])
-					if err != nil {
-						continue
-					}
-
-					// 检查端口匹配
-					extractedPort := extractUDPPortBetter(rm, is6)
-					if extractedPort != dport {
-						continue
-					}
-
+				// 验证端口匹配
+				if extractPort := extractUDPPortFromICMP(rm, is6); extractPort == dport {
 					peerIP := stripZone(peer.String())
 					rtt := time.Since(startTime)
 
-					respType := "unknown"
-					switch rm.Type {
-					case ipv4.ICMPTypeTimeExceeded, ipv6.ICMPTypeTimeExceeded:
-						respType = "ttl-exceeded"
-
-					case ipv4.ICMPTypeDestinationUnreachable, ipv6.ICMPTypeDestinationUnreachable:
-						respType = "destination"
-						// 检查是否是Port Unreachable (code=3)
-						if rm.Code == 3 {
-							hop.Reachable = true
-						}
-					}
-
-					results[i] = ProbeResult{
+					result := ProbeResult{
 						TTL:      ttl,
 						Seq:      i,
 						IP:       peerIP,
 						RTT:      rtt,
-						Type:     respType,
 						Received: true,
 					}
 
+					switch rm.Type {
+					case ipv4.ICMPTypeTimeExceeded, ipv6.ICMPTypeTimeExceeded:
+						result.Type = "ttl-exceeded"
+					case ipv4.ICMPTypeDestinationUnreachable, ipv6.ICMPTypeDestinationUnreachable:
+						result.Type = "destination"
+						if rm.Code == 3 { // Port Unreachable
+							hop.Reachable = true
+						}
+					}
+
+					results = append(results, result)
 					hopIPs[peerIP]++
 					received = true
-					receivedAny = true
-
-					// 检查是否到达目标
-					if respType == "destination" || peerIP == dstIPStr {
-						hop.Reachable = true
-					}
-				}
-
-				if !received {
-					results[i] = ProbeResult{
-						TTL:      ttl,
-						Seq:      i,
-						Received: false,
-					}
-				}
-			} else {
-				results[i] = ProbeResult{
-					TTL:      ttl,
-					Seq:      i,
-					Received: false,
 				}
 			}
 
-			// 小延迟
-			time.Sleep(10 * time.Millisecond)
+			if !received {
+				results = append(results, ProbeResult{TTL: ttl, Seq: i, Received: false})
+			}
 		}
 
-		// 处理结果
 		processHopResults(&hop, results, hopIPs)
-
-		// 记录统计
-		if receivedAny {
-			lastValidHop = ttl
-			consecutiveTimeouts = 0
-		} else {
-			consecutiveTimeouts++
-		}
 
 		select {
 		case out <- hop:
@@ -795,131 +628,274 @@ func traceUDP(ctx context.Context, dst *net.IPAddr, basePort uint16, count, time
 			return ctx.Err()
 		}
 
-		// 智能终止条件
 		if hop.Reachable {
-			// 如果标记为可达，直接结束
 			break
 		}
-
-		// 检查是否已经到达目标附近
-		// 如果上一跳(如hop 14)有响应，但当前跳没有响应，可能目标就在这里
-		if ttl > 10 && consecutiveTimeouts >= 2 && lastValidHop > 0 {
-			// 如果连续2跳都超时，且之前有有效响应，尝试直接探测目标
-			if ttl == lastValidHop+2 {
-				// 发送一个高TTL的探测直接到目标
-				if finalHop := probeDirectTarget(ctx, dst, basePort+9999, 64, timeoutMS, icmpConn, proto); finalHop != nil {
-					// 如果收到目标响应，输出最后一跳
-					*finalHop = HopStat{
-						Hop:       ttl + 1,
-						Sent:      1,
-						IPs:       []string{dst.IP.String()},
-						Hostnames: []string{lookupHostname(dst.IP)},
-						LossPct:   0,
-						Reachable: true,
-					}
-					geo, as := geoDB.Lookup(dst.IP)
-					finalHop.Geos = []string{geo}
-					finalHop.ASes = []string{as}
-
-					select {
-					case out <- *finalHop:
-					case <-ctx.Done():
-					}
-					break
-				}
-			}
-
-			// 如果连续3跳都超时，认为到达了过滤ICMP的目标
-			if consecutiveTimeouts >= 3 {
-				// 添加最终目标作为最后一跳（推测）
-				finalHop := HopStat{
-					Hop:       lastValidHop + 1,
-					Sent:      1,
-					IPs:       []string{dst.IP.String()},
-					Hostnames: []string{lookupHostname(dst.IP)},
-					LossPct:   0,
-					Reachable: true,
-				}
-				geo, as := geoDB.Lookup(dst.IP)
-				finalHop.Geos = []string{geo}
-				finalHop.ASes = []string{as}
-
-				select {
-				case out <- finalHop:
-				case <-ctx.Done():
-				}
-				break
-			}
-		}
 	}
 
 	return nil
 }
 
-// 直接探测目标
-func probeDirectTarget(ctx context.Context, dst *net.IPAddr, port uint16, ttl, timeoutMS int, icmpConn *icmp.PacketConn, proto int) *HopStat {
-	conn, err := net.DialTimeout("udp", fmt.Sprintf("%s:%d", dst.IP.String(), port), 50*time.Millisecond)
+// 创建 UDP socket
+func createUDPSocket(dst string, port uint16, ttl int, is6 bool) (net.Conn, error) {
+	dialer := &net.Dialer{
+		Timeout: 100 * time.Millisecond,
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				if is6 {
+					syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_UNICAST_HOPS, ttl)
+				} else {
+					syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
+				}
+			})
+		},
+	}
+	return dialer.Dial("udp", fmt.Sprintf("%s:%d", dst, port))
+}
+
+// =================== TCP traceroute ===================
+
+func traceTCP(ctx context.Context, dst *net.IPAddr, basePort uint16, count, timeoutMS, maxHops int, out chan<- HopStat) error {
+	is6 := dst.IP.To4() == nil
+
+	var network string
+	var proto int
+	if is6 {
+		network = "ip6:ipv6-icmp"
+		proto = 58
+	} else {
+		network = "ip4:icmp"
+		proto = 1
+	}
+
+	icmpConn, err := icmp.ListenPacket(network, "")
 	if err != nil {
-		return nil
+		return fmt.Errorf("icmp listen: %w", err)
 	}
-	defer conn.Close()
+	defer icmpConn.Close()
 
-	// 设置高TTL
-	if udpConn, ok := conn.(*net.UDPConn); ok {
-		raw, _ := udpConn.SyscallConn()
-		raw.Control(func(fd uintptr) {
-			is6 := dst.IP.To4() == nil
-			if is6 {
-				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_UNICAST_HOPS, ttl)
-			} else {
-				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
-			}
-		})
+	if basePort == 0 {
+		basePort = 80
 	}
 
-	startTime := time.Now()
-	conn.Write([]byte("FINAL_PROBE"))
+	// 创建全局ICMP响应收集器
+	type icmpResponse struct {
+		peer string
+		msg  *icmp.Message
+		time time.Time
+	}
 
-	deadline := time.Now().Add(time.Duration(timeoutMS) * time.Millisecond)
-	for time.Now().Before(deadline) {
-		buf := make([]byte, 1500)
-		icmpConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-		n, peer, err := icmpConn.ReadFrom(buf)
+	respChan := make(chan icmpResponse, 100)
+	stopCollector := make(chan struct{})
 
-		if err != nil || n == 0 {
-			continue
-		}
+	// 启动ICMP响应收集器
+	go func() {
+		for {
+			select {
+			case <-stopCollector:
+				return
+			default:
+				buf := make([]byte, 1500)
+				icmpConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+				n, peer, err := icmpConn.ReadFrom(buf)
+				if err != nil {
+					continue
+				}
 
-		rm, err := icmp.ParseMessage(proto, buf[:n])
-		if err != nil {
-			continue
-		}
-
-		// 检查是否收到Port Unreachable响应
-		if rm.Type == ipv4.ICMPTypeDestinationUnreachable || rm.Type == ipv6.ICMPTypeDestinationUnreachable {
-			if rm.Code == 3 { // Port Unreachable
-				// 验证响应来自目标或目标附近
-				_ = peer // 使用peer变量
-				rtt := time.Since(startTime)
-				return &HopStat{
-					LastMS: int(rtt.Milliseconds()),
-					BestMS: int(rtt.Milliseconds()),
-					AvgMS:  int(rtt.Milliseconds()),
+				if n > 0 {
+					rm, err := icmp.ParseMessage(proto, buf[:n])
+					if err == nil {
+						select {
+						case respChan <- icmpResponse{
+							peer: peer.String(),
+							msg:  rm,
+							time: time.Now(),
+						}:
+						case <-stopCollector:
+							return
+						}
+					}
 				}
 			}
+		}
+	}()
+
+	defer close(stopCollector)
+
+	for ttl := 1; ttl <= maxHops; ttl++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		hop := HopStat{Hop: ttl, Sent: count}
+		hopIPs := make(map[string]int)
+
+		// 存储每个探测的信息
+		type probeInfo struct {
+			seq       int
+			startTime time.Time
+			received  bool
+			result    ProbeResult
+		}
+
+		probes := make([]*probeInfo, count)
+
+		// 发送所有TCP探测包
+		for i := 0; i < count; i++ {
+			probe := &probeInfo{
+				seq:       i,
+				startTime: time.Now(),
+				received:  false,
+			}
+			probes[i] = probe
+
+			// 创建TCP连接（异步）
+			go func(idx int, p *probeInfo) {
+				dialer := &net.Dialer{
+					Timeout: time.Duration(timeoutMS) * time.Millisecond,
+					Control: func(network, address string, c syscall.RawConn) error {
+						return c.Control(func(fd uintptr) {
+							if is6 {
+								syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_UNICAST_HOPS, ttl)
+							} else {
+								syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
+							}
+						})
+					},
+				}
+
+				conn, err := dialer.Dial("tcp", fmt.Sprintf("%s:%d", dst.IP.String(), basePort))
+
+				if err == nil {
+					// TCP连接成功 - 到达目标
+					conn.Close()
+					rtt := time.Since(p.startTime)
+					p.received = true
+					p.result = ProbeResult{
+						TTL:      ttl,
+						Seq:      idx,
+						IP:       dst.IP.String(),
+						RTT:      rtt,
+						Type:     "tcp-reply",
+						Received: true,
+					}
+					hop.Reachable = true
+				}
+			}(i, probe)
+
+			// 小延迟避免发包过快
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		// 等待响应（收集ICMP或TCP响应）
+		deadline := time.Now().Add(time.Duration(timeoutMS) * time.Millisecond)
+
+		for time.Now().Before(deadline) {
+			select {
+			case resp := <-respChan:
+				peerIP := stripZone(resp.peer)
+
+				// 尝试匹配端口（TCP）
+				extractedPort := extractTCPPortFromICMP(resp.msg, is6)
+				if extractedPort != basePort {
+					continue
+				}
+
+				// 查找对应的探测（通过时间匹配）
+				for idx, probe := range probes {
+					if probe.received {
+						continue
+					}
+
+					// 检查时间范围（响应时间应该在探测之后）
+					if resp.time.After(probe.startTime) && resp.time.Sub(probe.startTime) < time.Duration(timeoutMS)*time.Millisecond {
+						rtt := resp.time.Sub(probe.startTime)
+
+						respType := "unknown"
+						switch resp.msg.Type {
+						case ipv4.ICMPTypeTimeExceeded, ipv6.ICMPTypeTimeExceeded:
+							respType = "ttl-exceeded"
+						case ipv4.ICMPTypeDestinationUnreachable, ipv6.ICMPTypeDestinationUnreachable:
+							respType = "destination"
+						}
+
+						probe.received = true
+						probe.result = ProbeResult{
+							TTL:      ttl,
+							Seq:      idx,
+							IP:       peerIP,
+							RTT:      rtt,
+							Type:     respType,
+							Received: true,
+						}
+
+						hopIPs[peerIP]++
+						break
+					}
+				}
+
+			case <-time.After(30 * time.Millisecond):
+				// 检查是否所有探测都已完成
+				allDone := true
+				for _, probe := range probes {
+					if !probe.received {
+						// 检查是否超时
+						if time.Since(probe.startTime) < time.Duration(timeoutMS)*time.Millisecond {
+							allDone = false
+							break
+						}
+					}
+				}
+				if allDone {
+					goto collectResults
+				}
+			}
+		}
+
+	collectResults:
+		// 收集最终结果
+		results := make([]ProbeResult, 0, count)
+		for _, probe := range probes {
+			if !probe.received {
+				probe.result = ProbeResult{
+					TTL:      ttl,
+					Seq:      probe.seq,
+					Received: false,
+				}
+			}
+			results = append(results, probe.result)
+		}
+
+		// 处理结果
+		processHopResults(&hop, results, hopIPs)
+
+		select {
+		case out <- hop:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		// 如果到达目标，停止
+		if hop.Reachable {
+			break
 		}
 	}
 
 	return nil
 }
 
-// 改进的端口提取函数
-func extractUDPPortBetter(msg *icmp.Message, is6 bool) uint16 {
+// =================== ICMP 响应解析 ===================
+
+// 改进的TCP端口提取函数
+func extractTCPPortFromICMP(msg *icmp.Message, is6 bool) uint16 {
 	if msg == nil {
 		return 0
 	}
 
 	var origData []byte
+
 	switch body := msg.Body.(type) {
 	case *icmp.TimeExceeded:
 		origData = body.Data
@@ -934,200 +910,68 @@ func extractUDPPortBetter(msg *icmp.Message, is6 bool) uint16 {
 	}
 
 	if is6 {
-		if len(origData) < 48 {
+		// IPv6处理
+		if len(origData) < 44 {
 			return 0
 		}
-		// 直接跳到UDP头部（假设没有扩展头部）
-		return binary.BigEndian.Uint16(origData[42:44])
+
+		// 检查Next Header字段
+		nextHeader := origData[6]
+		offset := 40
+
+		// 处理可能的扩展头部
+		for offset < len(origData)-4 {
+			switch nextHeader {
+			case 6: // TCP协议
+				if len(origData) >= offset+4 {
+					// TCP目标端口在TCP头部的第2-3字节
+					return binary.BigEndian.Uint16(origData[offset+2 : offset+4])
+				}
+				return 0
+
+			case 0, 43, 44, 60: // 扩展头部
+				if len(origData) < offset+8 {
+					return 0
+				}
+				nextHeader = origData[offset]
+				extLen := 8 + int(origData[offset+1])*8
+				offset += extLen
+
+			default:
+				return 0
+			}
+		}
+
 	} else {
-		if len(origData) < 28 {
+		// IPv4处理
+		if len(origData) < 20 {
 			return 0
 		}
+
+		// IP头部长度
 		ipHdrLen := int((origData[0] & 0x0f) * 4)
+		if ipHdrLen < 20 || len(origData) < ipHdrLen+4 {
+			return 0
+		}
+
+		// 检查协议字段（第9字节）- 必须是TCP(6)
+		if origData[9] != 6 {
+			return 0
+		}
+
+		// TCP头部
 		if len(origData) < ipHdrLen+4 {
 			return 0
 		}
-		// 确认是UDP协议
-		if origData[9] == 17 {
-			return binary.BigEndian.Uint16(origData[ipHdrLen+2 : ipHdrLen+4])
-		}
+
+		// TCP目标端口（TCP头部的第2-3字节）
+		return binary.BigEndian.Uint16(origData[ipHdrLen+2 : ipHdrLen+4])
 	}
 
 	return 0
 }
 
-// =================== TCP traceroute ===================
-
-func traceTCP(ctx context.Context, dst *net.IPAddr, basePort uint16, count, timeoutMS, maxHops int, out chan<- HopStat) error {
-	is6 := dst.IP.To4() == nil
-
-	// 监听 ICMP 响应
-	var network string
-	var proto int
-	if is6 {
-		network = "ip6:ipv6-icmp"
-		proto = 58
-	} else {
-		network = "ip4:icmp"
-		proto = 1
-	}
-
-	icmpConn, err := icmp.ListenPacket(network, "")
-	if err != nil {
-		return fmt.Errorf("icmp listen: %w", err)
-	}
-	defer icmpConn.Close()
-
-	pm := NewProbeManager()
-
-	for ttl := 1; ttl <= maxHops; ttl++ {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		hop := HopStat{Hop: ttl, Sent: count}
-		results := make([]ProbeResult, 0, count)
-		hopIPs := make(map[string]int)
-
-		var wg sync.WaitGroup
-		var mu sync.Mutex
-		resultsCh := make(chan ProbeResult, count)
-
-		for i := 0; i < count; i++ {
-			wg.Add(1)
-			go func(seq int) {
-				defer wg.Done()
-
-				// 使用固定端口或动态端口
-				dport := basePort
-				if basePort == 0 {
-					dport = 80 // 默认使用80端口
-				}
-
-				pm.Register(ttl, seq, dport)
-
-				dialer := &net.Dialer{
-					Timeout: time.Duration(timeoutMS) * time.Millisecond,
-					Control: func(network, address string, c syscall.RawConn) error {
-						var ctrlErr error
-						err := c.Control(func(fd uintptr) {
-							if is6 {
-								ctrlErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_UNICAST_HOPS, ttl)
-							} else {
-								ctrlErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
-							}
-						})
-						if err != nil {
-							return err
-						}
-						return ctrlErr
-					},
-				}
-
-				start := time.Now()
-				conn, err := dialer.Dial("tcp", fmt.Sprintf("%s:%d", dst.IP.String(), dport))
-
-				if err == nil {
-					// TCP连接成功，说明到达目标
-					conn.Close()
-					rtt := time.Since(start)
-					resultsCh <- ProbeResult{
-						TTL:      ttl,
-						Seq:      seq,
-						IP:       dst.IP.String(),
-						RTT:      rtt,
-						Type:     "tcp-reply",
-						Received: true,
-					}
-					mu.Lock()
-					hop.Reachable = true
-					mu.Unlock()
-					return
-				}
-
-				// 读取 ICMP 响应
-				deadline := time.Now().Add(time.Duration(timeoutMS) * time.Millisecond)
-				for time.Now().Before(deadline) {
-					_ = icmpConn.SetReadDeadline(deadline)
-					buf := make([]byte, 1500)
-					n, peer, err := icmpConn.ReadFrom(buf)
-
-					if err != nil {
-						continue
-					}
-
-					rm, err := icmp.ParseMessage(proto, buf[:n])
-					if err != nil {
-						continue
-					}
-
-					peerIP := stripZone(peer.String())
-
-					// 验证是否是我们的探测包的响应
-					if matchedPort := extractTCPPort(rm, is6); matchedPort == dport {
-						rtt := time.Since(start)
-
-						respType := "unknown"
-						switch rm.Type {
-						case ipv4.ICMPTypeTimeExceeded, ipv6.ICMPTypeTimeExceeded:
-							respType = "ttl-exceeded"
-						case ipv4.ICMPTypeDestinationUnreachable, ipv6.ICMPTypeDestinationUnreachable:
-							respType = "destination"
-						}
-
-						resultsCh <- ProbeResult{
-							TTL:      ttl,
-							Seq:      seq,
-							IP:       peerIP,
-							RTT:      rtt,
-							Type:     respType,
-							Received: true,
-						}
-						return
-					}
-				}
-
-				resultsCh <- ProbeResult{TTL: ttl, Seq: seq, Received: false}
-			}(i)
-		}
-
-		// 收集结果
-		go func() {
-			wg.Wait()
-			close(resultsCh)
-		}()
-
-		for result := range resultsCh {
-			mu.Lock()
-			results = append(results, result)
-			if result.Received && result.IP != "" {
-				hopIPs[result.IP]++
-			}
-			mu.Unlock()
-		}
-
-		// 处理结果
-		processHopResults(&hop, results, hopIPs)
-
-		select {
-		case out <- hop:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-
-		if hop.Reachable {
-			break
-		}
-	}
-	return nil
-}
-
-// =================== ICMP 响应解析 ===================
-
 func validateICMPResponse(msg *icmp.Message, pid, seq int) bool {
-	// Time Exceeded 和 Destination Unreachable 消息包含原始IP包
 	var origData []byte
 
 	switch body := msg.Body.(type) {
@@ -1139,32 +983,26 @@ func validateICMPResponse(msg *icmp.Message, pid, seq int) bool {
 		return false
 	}
 
-	if len(origData) < 28 { // IP header (20) + ICMP header (8)
+	if len(origData) < 28 {
 		return false
 	}
 
-	// 跳过IP头部（通常是20字节，但可能有选项）
 	ipHdrLen := int((origData[0] & 0x0f) * 4)
 	if len(origData) < ipHdrLen+8 {
 		return false
 	}
 
-	// 解析ICMP头部
 	icmpData := origData[ipHdrLen:]
-	if len(icmpData) >= 8 {
-		// 检查ICMP类型是否为Echo Request
-		if icmpData[0] == 8 { // Echo Request
-			// 提取ID和Seq
-			origID := int(binary.BigEndian.Uint16(icmpData[4:6]))
-			origSeq := int(binary.BigEndian.Uint16(icmpData[6:8]))
-			return origID == pid && origSeq == seq
-		}
+	if len(icmpData) >= 8 && icmpData[0] == 8 {
+		origID := int(binary.BigEndian.Uint16(icmpData[4:6]))
+		origSeq := int(binary.BigEndian.Uint16(icmpData[6:8]))
+		return origID == pid && origSeq == seq
 	}
 
 	return false
 }
 
-func extractUDPPort(msg *icmp.Message, is6 bool) uint16 {
+func extractUDPPortFromICMP(msg *icmp.Message, is6 bool) uint16 {
 	var origData []byte
 
 	switch body := msg.Body.(type) {
@@ -1177,70 +1015,22 @@ func extractUDPPort(msg *icmp.Message, is6 bool) uint16 {
 	}
 
 	if is6 {
-		// IPv6: 跳过IPv6头部（40字节）
-		if len(origData) < 40+8 {
+		if len(origData) < 48 {
 			return 0
 		}
-		// UDP头部从第40字节开始
-		udpData := origData[40:]
-		if len(udpData) >= 4 {
-			return binary.BigEndian.Uint16(udpData[2:4]) // 目标端口
+		// 检查 Next Header
+		if origData[6] == 17 { // UDP
+			return binary.BigEndian.Uint16(origData[42:44])
 		}
 	} else {
-		// IPv4: 跳过IP头部
-		if len(origData) < 20+8 {
+		if len(origData) < 28 {
 			return 0
 		}
 		ipHdrLen := int((origData[0] & 0x0f) * 4)
-		if len(origData) < ipHdrLen+8 {
+		if len(origData) < ipHdrLen+4 || origData[9] != 17 {
 			return 0
 		}
-		// UDP头部
-		udpData := origData[ipHdrLen:]
-		if len(udpData) >= 4 {
-			return binary.BigEndian.Uint16(udpData[2:4]) // 目标端口
-		}
-	}
-
-	return 0
-}
-
-func extractTCPPort(msg *icmp.Message, is6 bool) uint16 {
-	var origData []byte
-
-	switch body := msg.Body.(type) {
-	case *icmp.TimeExceeded:
-		origData = body.Data
-	case *icmp.DstUnreach:
-		origData = body.Data
-	default:
-		return 0
-	}
-
-	if is6 {
-		// IPv6: 跳过IPv6头部（40字节）
-		if len(origData) < 40+8 {
-			return 0
-		}
-		// TCP头部从第40字节开始
-		tcpData := origData[40:]
-		if len(tcpData) >= 4 {
-			return binary.BigEndian.Uint16(tcpData[2:4]) // 目标端口
-		}
-	} else {
-		// IPv4: 跳过IP头部
-		if len(origData) < 20+8 {
-			return 0
-		}
-		ipHdrLen := int((origData[0] & 0x0f) * 4)
-		if len(origData) < ipHdrLen+8 {
-			return 0
-		}
-		// TCP头部
-		tcpData := origData[ipHdrLen:]
-		if len(tcpData) >= 4 {
-			return binary.BigEndian.Uint16(tcpData[2:4]) // 目标端口
-		}
+		return binary.BigEndian.Uint16(origData[ipHdrLen+2 : ipHdrLen+4])
 	}
 
 	return 0
@@ -1259,7 +1049,7 @@ func processHopResults(hop *HopStat, results []ProbeResult, hopIPs map[string]in
 		}
 	}
 
-	// 收集所有响应的 IP（按出现次数排序）
+	// 按出现次数排序 IP
 	type ipCount struct {
 		ip    string
 		count int
@@ -1268,7 +1058,8 @@ func processHopResults(hop *HopStat, results []ProbeResult, hopIPs map[string]in
 	for ip, cnt := range hopIPs {
 		ipList = append(ipList, ipCount{ip: ip, count: cnt})
 	}
-	// 按出现次数降序排序
+
+	// 冒泡排序
 	for i := 0; i < len(ipList); i++ {
 		for j := i + 1; j < len(ipList); j++ {
 			if ipList[j].count > ipList[i].count {
@@ -1277,10 +1068,9 @@ func processHopResults(hop *HopStat, results []ProbeResult, hopIPs map[string]in
 		}
 	}
 
-	// 记录所有 IP 和对应信息
 	for _, item := range ipList {
 		hop.IPs = append(hop.IPs, item.ip)
-		if ip := parseHostIP(item.ip); ip != nil {
+		if ip := net.ParseIP(item.ip); ip != nil {
 			hop.Hostnames = append(hop.Hostnames, lookupHostname(ip))
 			geo, as := geoDB.Lookup(ip)
 			hop.Geos = append(hop.Geos, geo)
@@ -1309,7 +1099,6 @@ var dnsCache = sync.Map{}
 func lookupHostname(ip net.IP) string {
 	ipStr := ip.String()
 
-	// 检查缓存
 	if cached, ok := dnsCache.Load(ipStr); ok {
 		return cached.(string)
 	}
@@ -1323,18 +1112,16 @@ func lookupHostname(ip net.IP) string {
 		return "--"
 	}
 
-	// 去掉末尾的点
 	hostname := strings.TrimSuffix(names[0], ".")
 	dnsCache.Store(ipStr, hostname)
 	return hostname
 }
 
-// =================== 杂项工具 ===================
+// =================== 工具函数 ===================
 
 func stripZone(s string) string {
 	if i := strings.IndexByte(s, '%'); i >= 0 {
-		j := strings.IndexByte(s[i:], ']')
-		if j >= 0 {
+		if j := strings.IndexByte(s[i:], ']'); j >= 0 {
 			return s[:i] + s[i+j:]
 		}
 		return s[:i]
@@ -1342,26 +1129,17 @@ func stripZone(s string) string {
 	return s
 }
 
-func sameHost(a, b string) bool {
-	aa := strings.Trim(a, "[]")
-	bb := strings.Trim(b, "[]")
-	if i := strings.LastIndexByte(aa, ':'); i > -1 && strings.Count(aa, ":") == 1 {
-		aa = aa[:i]
+func normalizeIP(s string) string {
+	s = strings.Trim(s, "[]")
+	if i := strings.LastIndex(s, ":"); i > 0 {
+		if strings.Count(s[:i], ".") == 3 {
+			s = s[:i]
+		}
 	}
-	if i := strings.LastIndexByte(bb, ':'); i > -1 && strings.Count(bb, ":") == 1 {
-		bb = bb[:i]
+	if ip := net.ParseIP(s); ip != nil {
+		return ip.String()
 	}
-	return aa == bb
-}
-
-func parseHostIP(s string) net.IP {
-	s = strings.TrimSpace(s)
-	s = strings.TrimPrefix(s, "[")
-	s = strings.TrimSuffix(s, "]")
-	if i := strings.LastIndexByte(s, ':'); i >= 0 && strings.Count(s, ":") == 1 {
-		s = s[:i]
-	}
-	return net.ParseIP(s)
+	return s
 }
 
 func meanDur(a []time.Duration) time.Duration {
