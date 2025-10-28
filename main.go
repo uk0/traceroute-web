@@ -115,7 +115,7 @@ func (g *GeoDB) Lookup(ip net.IP) (geo string, as string) {
 	defer g.mu.RUnlock()
 
 	if ip == nil {
-		return "--", "--"
+		return "*", "*"
 	}
 
 	// ASN
@@ -158,7 +158,7 @@ func (g *GeoDB) Lookup(ip net.IP) (geo string, as string) {
 	}
 
 	if countryName == "" && cityName == "" {
-		geo = "--"
+		geo = "*"
 	} else if countryName != "" && cityName != "" {
 		geo = countryName + " / " + cityName
 	} else {
@@ -166,7 +166,7 @@ func (g *GeoDB) Lookup(ip net.IP) (geo string, as string) {
 	}
 
 	if as == "" {
-		as = "--"
+		as = "*"
 	}
 	return geo, as
 }
@@ -1085,9 +1085,9 @@ func processHopResults(hop *HopStat, results []ProbeResult, hopIPs map[string]in
 			hop.Geos = append(hop.Geos, geo)
 			hop.ASes = append(hop.ASes, as)
 		} else {
-			hop.Hostnames = append(hop.Hostnames, "--")
-			hop.Geos = append(hop.Geos, "--")
-			hop.ASes = append(hop.ASes, "--")
+			hop.Hostnames = append(hop.Hostnames, "*")
+			hop.Geos = append(hop.Geos, "*")
+			hop.ASes = append(hop.ASes, "*")
 		}
 	}
 
@@ -1117,8 +1117,8 @@ func lookupHostname(ip net.IP) string {
 
 	names, err := net.DefaultResolver.LookupAddr(ctx, ipStr)
 	if err != nil || len(names) == 0 {
-		dnsCache.Store(ipStr, "--")
-		return "--"
+		dnsCache.Store(ipStr, "*")
+		return "*"
 	}
 
 	hostname := strings.TrimSuffix(names[0], ".")
