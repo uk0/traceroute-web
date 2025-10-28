@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <title>追踪中…</title>
+    <link rel="stylesheet" href="/static/app.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+<div class="container">
+    <h1>追踪结果：<span id="title"></span></h1>
+    <div class="meta">
+        <span>模式：<span id="mode"></span></span>
+        <span id="dportWrap" style="display:none;">目的端口：<span id="dport"></span></span>
+    </div>
+
+    <div class="table-wrap">
+        <table id="tbl">
+            <thead>
+            <tr>
+                <th>跳数</th>
+                <th>IP</th>
+                <th>主机名</th>
+                <th>地区（仅供参考）</th>
+                <th>AS号（仅供参考）</th>
+                <th>丢包率</th>
+                <th>发送</th>
+                <th>最新(ms)</th>
+                <th>最快(ms)</th>
+                <th>最慢(ms)</th>
+                <th>平均(ms)</th>
+            </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+    </div>
+
+    <p><a href="/">再测一个</a></p>
+</div>
+
+<script>
+    (function(){
+        const q = new URLSearchParams(location.search);
+        const target = q.get('target') || '{{.Target}}';
+        const mode = q.get('mode') || '{{.Mode}}';
+        const dport = q.get('dport') || '{{.DPort}}';
+        const maxhops = q.get('maxhops') || '{{.MaxHops}}';
+        const count = q.get('count') || '{{.Count}}';
+        const timeout = q.get('timeout') || '{{.Timeout}}';
+
+        document.getElementById('title').textContent = target;
+        document.getElementById('mode').textContent = mode;
+        if (mode === 'tcp' || mode === 'udp') {
+            document.getElementById('dportWrap').style.display = 'inline';
+            document.getElementById('dport').textContent = dport;
+        }
+
+        const tbody = document.querySelector('#tbl tbody');
+        const rows = new Map();
+
+        function fmtPct(n){
+            if (n == null || isNaN(n)) return '--';
+            return Math.round(n) + '%';
+        }
+
+        function highlightAS(asText) {
+            if (!asText || asText === '--') return asText;
+            return asText.replace(/(AS\d+)/g, '<span class="as-highlight">$1</span>');
+        }
+
+        function formatMultipleValues(arr) {
+            if (!arr || arr.length === 0) return '--';
+            if (arr.length === 1) return arr[0];
+            return arr.map((item, idx) => `<div class="multi-item">${item}</div>`).join('');
+        }
+
+        function formatMultipleIPs(ips) {
+            if (!ips || ips.length === 0) return '--';
+            if (ips.length === 1) return ips[0];
+            return ips.map((ip, idx) => `<div class="multi-item ip-item">${ip}</div>`).join('');
+        }
+
+        function formatMultipleAS(ases) {
+            if (!ases || ases.length === 0) return '--';
+            if (ases.length === 1) return highlightAS(ases[0]);
+            return ases.map((as, idx) => `<div class="multi-item">${highlightAS(as)}</div>`).join('');
+        }
+
+        function addOrUpdateRow(h){
+            let tr = rows.get(h.hop);
+            let isNewRow = false;
+
+            if (!tr) {
+                tr = document.createElement('tr');
+                tr.innerHTML = `
+        <td class="hop"></td>
+        <td class="ip">--</td>
+        <td class="hostname">--</td>
+        <td class="geo">--</td>
+        <td class="asn">--</td>
+        <td class="loss">--</td>
+        <td class="sent">--</td>
+        <td class="last">--</td>
+        <td class="best">--</td>
+        <td class="worst">--</td>
+        <td class="avg">--</td>
+      `;
+                tbody.appendChild(tr);
+                rows.set(h.hop, tr);
+                isNewRow = true;
+            }
+
+            // 如果这一跳已经标记为可达，或者新数据有IP而旧数据没有，则更新
+            const shouldUpdate = isNewRow ||
+                h.reachable ||
+                (h.ips && h.ips.length > 0 && tr.querySelector('.ip').textContent === '--');
+
+            if (shouldUpdate) {
+                tr.querySelector('.hop').textContent = h.hop;
+
+                // 处理多个 IP 的情况
+                if (h.ips && h.ips.length > 0) {
+                    tr.querySelector('.ip').innerHTML = formatMultipleIPs(h.ips);
+                } else {
+                    tr.querySelector('.ip').textContent = '--';
+                }
+
+                // 处理多个主机名的情况
+                if (h.hostnames && h.hostnames.length > 0) {
+                    tr.querySelector('.hostname').innerHTML = formatMultipleValues(h.hostnames);
+                } else {
+                    tr.querySelector('.hostname').textContent = '--';
+                }
+
+                // 处理多个地理位置的情况
+                if (h.geos && h.geos.length > 0) {
+                    tr.querySelector('.geo').innerHTML = formatMultipleValues(h.geos);
+                } else {
+                    tr.querySelector('.geo').textContent = '--';
+                }
+
+                // 处理多个 AS 的情况
+                if (h.ases && h.ases.length > 0) {
+                    tr.querySelector('.asn').innerHTML = formatMultipleAS(h.ases);
+                } else {
+                    tr.querySelector('.asn').innerHTML = '--';
+                }
+
+                tr.querySelector('.loss').textContent = fmtPct(h.loss_pct);
+                tr.querySelector('.sent').textContent = h.sent || 0;
+                tr.querySelector('.last').textContent = h.last_ms || '--';
+                tr.querySelector('.best').textContent = h.best_ms || '--';
+                tr.querySelector('.worst').textContent = h.worst_ms || '--';
+                tr.querySelector('.avg').textContent = h.avg_ms || '--';
+
+                // 移除旧的样式
+                tr.classList.remove('dim', 'reachable', 'unreachable');
+
+                // 添加新的样式
+                if (h.reachable) {
+                    tr.classList.add('reachable');
+                } else if (!h.ips || h.ips.length === 0) {
+                    tr.classList.add('dim');
+                } else {
+                    tr.classList.add('unreachable');
+                }
+            }
+        }
+
+        const url = `/stream?target=${encodeURIComponent(target)}&mode=${encodeURIComponent(mode)}&dport=${encodeURIComponent(dport)}&maxhops=${encodeURIComponent(maxhops)}&count=${encodeURIComponent(count)}&timeout=${encodeURIComponent(timeout)}`;
+        const es = new EventSource(url);
+        es.onmessage = (e) => {
+            if (!e.data) return;
+            try {
+                const msg = JSON.parse(e.data);
+                if (msg.type === 'hop') {
+                    addOrUpdateRow(msg.data);
+                } else if (msg.type === 'error') {
+                    alert('错误: ' + msg.msg);
+                } else if (msg.type === 'done') {
+                    es.close();
+                }
+            } catch (err) {console.error(err)}
+        };
+        es.onerror = () => {
+            es.close();
+        };
+    })();
+</script>
+</body>
+</html>

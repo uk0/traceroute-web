@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <title>在线路由追踪工具 · 纯 Go 实现</title>
+    <link rel="stylesheet" href="/static/app.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+<div class="container">
+    <h1>🌐 在线路由追踪工具</h1>
+    <div class="card">
+        <form method="post" action="/trace">
+            <div class="form-section">
+                <h3>基本设置</h3>
+                <div class="row">
+                    <label>目标地址</label>
+                    <input name="target" placeholder="域名或IP，如 google.com / 8.8.8.8" required autofocus>
+                </div>
+                <div class="row g">
+                    <div>
+                        <label>追踪模式</label>
+                        <select name="mode" id="modeSelect">
+                            <option value="icmp">ICMP (推荐)</option>
+                            <option value="udp">UDP</option>
+                            <option value="tcp">TCP (需要root)</option>
+                        </select>
+                        <span class="hint">ICMP 最准确，UDP 兼容性好</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="form-section">
+                <h3>高级选项</h3>
+                <div class="row g">
+                    <div>
+                        <label>起始端口</label>
+                        <input type="number" name="dport" id="dportInput" min="1" max="65535" value="33434">
+                        <span class="hint">UDP/TCP 模式使用</span>
+                    </div>
+                    <div>
+                        <label>最大跳数</label>
+                        <input type="number" name="maxhops" min="1" max="64" value="{{.defaultMaxHops}}">
+                        <span class="hint">通常 30 足够</span>
+                    </div>
+                    <div>
+                        <label>每跳探测次数</label>
+                        <input type="number" name="count" min="1" max="10" value="{{.defaultCount}}">
+                        <span class="hint">建议 6 次</span>
+                    </div>
+                    <div>
+                        <label>单跳超时(ms)</label>
+                        <input type="number" name="timeout" min="300" max="3000" value="{{.defaultTimeout}}">
+                        <span class="hint">建议 800ms</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="row submit-row">
+                <button type="submit" class="btn-primary">🚀 开始追踪</button>
+                <button type="button" class="btn-secondary" onclick="resetForm()">重置</button>
+            </div>
+        </form>
+
+        {{if .tcpNeedRoot}}
+        <div class="warning">
+            ⚠️ TCP 模式需要 root 权限或 CAP_NET_RAW 能力
+        </div>
+        {{end}}
+
+        <div class="info-box">
+            <h4>说明：</h4>
+            <ul>
+                <li><strong>ICMP 模式</strong>：最标准的 traceroute 方式，结果最准确</li>
+                <li><strong>UDP 模式</strong>：使用 UDP 数据包，适用于 ICMP 被过滤的网络</li>
+                <li><strong>TCP 模式</strong>：使用 TCP SYN 包，可穿透某些防火墙</li>
+            </ul>
+        </div>
+    </div>
+</div>
+
+<script>
+    document.getElementById('modeSelect').addEventListener('change', function() {
+        const mode = this.value;
+        const dportInput = document.getElementById('dportInput');
+        if (mode === 'tcp') {
+            dportInput.value = '80';  // TCP 默认 80 端口
+        } else if (mode === 'udp') {
+            dportInput.value = '33434';  // UDP 默认 33434
+        }
+    });
+
+    function resetForm() {
+        document.querySelector('form').reset();
+    }
+</script>
+</body>
+</html>
