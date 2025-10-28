@@ -54,7 +54,7 @@ var cfg = Config{
 	ListenAddr:     ":8080",
 	MaxHops:        30,
 	Count:          3,
-	TimeoutMS:      1000,
+	TimeoutMS:      800,
 	GeoASNPath:     "./GeoLite2-ASN.mmdb",
 	GeoCityPath:    "./GeoLite2-City.mmdb",
 	GeoCountryPath: "./GeoLite2-Country.mmdb",
@@ -653,11 +653,45 @@ func createUDPSocket(dst string, port uint16, ttl int, is6 bool) (net.Conn, erro
 	return dialer.Dial("udp", fmt.Sprintf("%s:%d", dst, port))
 }
 
-// =================== TCP traceroute ===================
+// =================== Probe Manager ===================
+
+type ProbeManager struct {
+	probes map[string]*ProbeInfo // key: "ttl:seq" or port for TCP/UDP
+	mu     sync.RWMutex
+}
+
+type ProbeInfo struct {
+	TTL       int
+	Seq       int
+	Port      uint16
+	StartTime time.Time
+}
+
+func NewProbeManager() *ProbeManager {
+	return &ProbeManager{
+		probes: make(map[string]*ProbeInfo),
+	}
+}
+
+func (pm *ProbeManager) Register(ttl, seq int, port uint16) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	key := fmt.Sprintf("%d:%d", ttl, seq)
+	if port > 0 {
+		key = fmt.Sprintf("port:%d", port)
+	}
+	pm.probes[key] = &ProbeInfo{
+		TTL:       ttl,
+		Seq:       seq,
+		Port:      port,
+		StartTime: time.Now(),
+	}
+}
 
 func traceTCP(ctx context.Context, dst *net.IPAddr, basePort uint16, count, timeoutMS, maxHops int, out chan<- HopStat) error {
 	is6 := dst.IP.To4() == nil
 
+	// 监听 ICMP 响应
 	var network string
 	var proto int
 	if is6 {
@@ -674,53 +708,7 @@ func traceTCP(ctx context.Context, dst *net.IPAddr, basePort uint16, count, time
 	}
 	defer icmpConn.Close()
 
-	if basePort == 0 {
-		basePort = 80
-	}
-
-	// 创建全局ICMP响应收集器
-	type icmpResponse struct {
-		peer string
-		msg  *icmp.Message
-		time time.Time
-	}
-
-	respChan := make(chan icmpResponse, 100)
-	stopCollector := make(chan struct{})
-
-	// 启动ICMP响应收集器
-	go func() {
-		for {
-			select {
-			case <-stopCollector:
-				return
-			default:
-				buf := make([]byte, 1500)
-				icmpConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-				n, peer, err := icmpConn.ReadFrom(buf)
-				if err != nil {
-					continue
-				}
-
-				if n > 0 {
-					rm, err := icmp.ParseMessage(proto, buf[:n])
-					if err == nil {
-						select {
-						case respChan <- icmpResponse{
-							peer: peer.String(),
-							msg:  rm,
-							time: time.Now(),
-						}:
-						case <-stopCollector:
-							return
-						}
-					}
-				}
-			}
-		}
-	}()
-
-	defer close(stopCollector)
+	pm := NewProbeManager()
 
 	for ttl := 1; ttl <= maxHops; ttl++ {
 		select {
@@ -730,142 +718,124 @@ func traceTCP(ctx context.Context, dst *net.IPAddr, basePort uint16, count, time
 		}
 
 		hop := HopStat{Hop: ttl, Sent: count}
+		results := make([]ProbeResult, 0, count)
 		hopIPs := make(map[string]int)
 
-		// 存储每个探测的信息
-		type probeInfo struct {
-			seq       int
-			startTime time.Time
-			received  bool
-			result    ProbeResult
-		}
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		resultsCh := make(chan ProbeResult, count)
 
-		probes := make([]*probeInfo, count)
-
-		// 发送所有TCP探测包
 		for i := 0; i < count; i++ {
-			probe := &probeInfo{
-				seq:       i,
-				startTime: time.Now(),
-				received:  false,
-			}
-			probes[i] = probe
+			wg.Add(1)
+			go func(seq int) {
+				defer wg.Done()
 
-			// 创建TCP连接（异步）
-			go func(idx int, p *probeInfo) {
+				// 使用固定端口或动态端口
+				dport := basePort
+				if basePort == 0 {
+					dport = 80 // 默认使用80端口
+				}
+
+				pm.Register(ttl, seq, dport)
+
 				dialer := &net.Dialer{
 					Timeout: time.Duration(timeoutMS) * time.Millisecond,
 					Control: func(network, address string, c syscall.RawConn) error {
-						return c.Control(func(fd uintptr) {
+						var ctrlErr error
+						err := c.Control(func(fd uintptr) {
 							if is6 {
-								syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_UNICAST_HOPS, ttl)
+								ctrlErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_UNICAST_HOPS, ttl)
 							} else {
-								syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
+								ctrlErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
 							}
 						})
+						if err != nil {
+							return err
+						}
+						return ctrlErr
 					},
 				}
 
-				conn, err := dialer.Dial("tcp", fmt.Sprintf("%s:%d", dst.IP.String(), basePort))
+				start := time.Now()
+				conn, err := dialer.Dial("tcp", fmt.Sprintf("%s:%d", dst.IP.String(), dport))
 
 				if err == nil {
-					// TCP连接成功 - 到达目标
+					// TCP连接成功，说明到达目标
 					conn.Close()
-					rtt := time.Since(p.startTime)
-					p.received = true
-					p.result = ProbeResult{
+					rtt := time.Since(start)
+					resultsCh <- ProbeResult{
 						TTL:      ttl,
-						Seq:      idx,
+						Seq:      seq,
 						IP:       dst.IP.String(),
 						RTT:      rtt,
 						Type:     "tcp-reply",
 						Received: true,
 					}
+					mu.Lock()
 					hop.Reachable = true
-				}
-			}(i, probe)
-
-			// 小延迟避免发包过快
-			time.Sleep(50 * time.Millisecond)
-		}
-
-		// 等待响应（收集ICMP或TCP响应）
-		deadline := time.Now().Add(time.Duration(timeoutMS) * time.Millisecond)
-
-		for time.Now().Before(deadline) {
-			select {
-			case resp := <-respChan:
-				peerIP := stripZone(resp.peer)
-
-				// 尝试匹配端口（TCP）
-				extractedPort := extractTCPPortFromICMP(resp.msg, is6)
-				if extractedPort != basePort {
-					continue
+					mu.Unlock()
+					return
 				}
 
-				// 查找对应的探测（通过时间匹配）
-				for idx, probe := range probes {
-					if probe.received {
+				// 读取 ICMP 响应
+				deadline := time.Now().Add(time.Duration(timeoutMS) * time.Millisecond)
+				for time.Now().Before(deadline) {
+					_ = icmpConn.SetReadDeadline(deadline)
+					buf := make([]byte, 1500)
+					n, peer, err := icmpConn.ReadFrom(buf)
+
+					if err != nil {
 						continue
 					}
 
-					// 检查时间范围（响应时间应该在探测之后）
-					if resp.time.After(probe.startTime) && resp.time.Sub(probe.startTime) < time.Duration(timeoutMS)*time.Millisecond {
-						rtt := resp.time.Sub(probe.startTime)
+					rm, err := icmp.ParseMessage(proto, buf[:n])
+					if err != nil {
+						continue
+					}
+
+					peerIP := stripZone(peer.String())
+
+					// 验证是否是我们的探测包的响应
+					if matchedPort := extractTCPPort(rm, is6); matchedPort == dport {
+						rtt := time.Since(start)
 
 						respType := "unknown"
-						switch resp.msg.Type {
+						switch rm.Type {
 						case ipv4.ICMPTypeTimeExceeded, ipv6.ICMPTypeTimeExceeded:
 							respType = "ttl-exceeded"
 						case ipv4.ICMPTypeDestinationUnreachable, ipv6.ICMPTypeDestinationUnreachable:
 							respType = "destination"
 						}
 
-						probe.received = true
-						probe.result = ProbeResult{
+						resultsCh <- ProbeResult{
 							TTL:      ttl,
-							Seq:      idx,
+							Seq:      seq,
 							IP:       peerIP,
 							RTT:      rtt,
 							Type:     respType,
 							Received: true,
 						}
-
-						hopIPs[peerIP]++
-						break
+						return
 					}
 				}
 
-			case <-time.After(30 * time.Millisecond):
-				// 检查是否所有探测都已完成
-				allDone := true
-				for _, probe := range probes {
-					if !probe.received {
-						// 检查是否超时
-						if time.Since(probe.startTime) < time.Duration(timeoutMS)*time.Millisecond {
-							allDone = false
-							break
-						}
-					}
-				}
-				if allDone {
-					goto collectResults
-				}
-			}
+				resultsCh <- ProbeResult{TTL: ttl, Seq: seq, Received: false}
+			}(i)
 		}
 
-	collectResults:
-		// 收集最终结果
-		results := make([]ProbeResult, 0, count)
-		for _, probe := range probes {
-			if !probe.received {
-				probe.result = ProbeResult{
-					TTL:      ttl,
-					Seq:      probe.seq,
-					Received: false,
-				}
+		// 收集结果
+		go func() {
+			wg.Wait()
+			close(resultsCh)
+		}()
+
+		for result := range resultsCh {
+			mu.Lock()
+			results = append(results, result)
+			if result.Received && result.IP != "" {
+				hopIPs[result.IP]++
 			}
-			results = append(results, probe.result)
+			mu.Unlock()
 		}
 
 		// 处理结果
@@ -877,13 +847,52 @@ func traceTCP(ctx context.Context, dst *net.IPAddr, basePort uint16, count, time
 			return ctx.Err()
 		}
 
-		// 如果到达目标，停止
 		if hop.Reachable {
 			break
 		}
 	}
-
 	return nil
+}
+
+func extractTCPPort(msg *icmp.Message, is6 bool) uint16 {
+	var origData []byte
+
+	switch body := msg.Body.(type) {
+	case *icmp.TimeExceeded:
+		origData = body.Data
+	case *icmp.DstUnreach:
+		origData = body.Data
+	default:
+		return 0
+	}
+
+	if is6 {
+		// IPv6: 跳过IPv6头部（40字节）
+		if len(origData) < 40+8 {
+			return 0
+		}
+		// TCP头部从第40字节开始
+		tcpData := origData[40:]
+		if len(tcpData) >= 4 {
+			return binary.BigEndian.Uint16(tcpData[2:4]) // 目标端口
+		}
+	} else {
+		// IPv4: 跳过IP头部
+		if len(origData) < 20+8 {
+			return 0
+		}
+		ipHdrLen := int((origData[0] & 0x0f) * 4)
+		if len(origData) < ipHdrLen+8 {
+			return 0
+		}
+		// TCP头部
+		tcpData := origData[ipHdrLen:]
+		if len(tcpData) >= 4 {
+			return binary.BigEndian.Uint16(tcpData[2:4]) // 目标端口
+		}
+	}
+
+	return 0
 }
 
 // =================== ICMP 响应解析 ===================
