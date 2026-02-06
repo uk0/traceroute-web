@@ -179,18 +179,19 @@ func fileExists(p string) bool {
 // =================== 数据结构 ===================
 
 type HopStat struct {
-	Hop       int      `json:"hop"`
-	IPs       []string `json:"ips"`
-	Hostnames []string `json:"hostnames"`
-	Sent      int      `json:"sent"`
-	LossPct   float64  `json:"loss_pct"`
-	LastMS    int      `json:"last_ms"`
-	BestMS    int      `json:"best_ms"`
-	WorstMS   int      `json:"worst_ms"`
-	AvgMS     int      `json:"avg_ms"`
-	Reachable bool     `json:"reachable"`
-	Geos      []string `json:"geos"`
-	ASes      []string `json:"ases"`
+	Hop          int      `json:"hop"`
+	IPs          []string `json:"ips"`
+	Hostnames    []string `json:"hostnames"`
+	Sent         int      `json:"sent"`
+	LossPct      float64  `json:"loss_pct"`
+	LastMS       int      `json:"last_ms"`
+	BestMS       int      `json:"best_ms"`
+	WorstMS      int      `json:"worst_ms"`
+	AvgMS        int      `json:"avg_ms"`
+	Reachable    bool     `json:"reachable"`
+	Geos         []string `json:"geos"`
+	ASes         []string `json:"ases"`
+	NetworkTypes []string `json:"network_types"` // 网络类型标识
 }
 
 type TraceParams struct {
@@ -650,7 +651,7 @@ func createUDPSocket(dst string, port uint16, ttl int, is6 bool) (net.Conn, erro
 			})
 		},
 	}
-	return dialer.Dial("udp", fmt.Sprintf("%s:%d", dst, port))
+	return dialer.Dial("udp", net.JoinHostPort(dst, strconv.Itoa(int(port))))
 }
 
 // =================== Probe Manager ===================
@@ -708,7 +709,10 @@ func traceTCP(ctx context.Context, dst *net.IPAddr, basePort uint16, count, time
 	}
 	defer icmpConn.Close()
 
-	pm := NewProbeManager()
+	// 默认端口
+	if basePort == 0 {
+		basePort = 80
+	}
 
 	for ttl := 1; ttl <= maxHops; ttl++ {
 		select {
@@ -718,127 +722,23 @@ func traceTCP(ctx context.Context, dst *net.IPAddr, basePort uint16, count, time
 		}
 
 		hop := HopStat{Hop: ttl, Sent: count}
-		results := make([]ProbeResult, 0, count)
 		hopIPs := make(map[string]int)
+		var results []ProbeResult
 
-		var wg sync.WaitGroup
-		var mu sync.Mutex
-		resultsCh := make(chan ProbeResult, count)
-
+		// 串行发送探测包，避免 ICMP 响应竞争
 		for i := 0; i < count; i++ {
-			wg.Add(1)
-			go func(seq int) {
-				defer wg.Done()
-
-				// 使用固定端口或动态端口
-				dport := basePort
-				if basePort == 0 {
-					dport = 80 // 默认使用80端口
-				}
-
-				pm.Register(ttl, seq, dport)
-
-				dialer := &net.Dialer{
-					Timeout: time.Duration(timeoutMS) * time.Millisecond,
-					Control: func(network, address string, c syscall.RawConn) error {
-						var ctrlErr error
-						err := c.Control(func(fd uintptr) {
-							if is6 {
-								ctrlErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_UNICAST_HOPS, ttl)
-							} else {
-								ctrlErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
-							}
-						})
-						if err != nil {
-							return err
-						}
-						return ctrlErr
-					},
-				}
-
-				start := time.Now()
-				conn, err := dialer.Dial("tcp", fmt.Sprintf("%s:%d", dst.IP.String(), dport))
-
-				if err == nil {
-					// TCP连接成功，说明到达目标
-					conn.Close()
-					rtt := time.Since(start)
-					resultsCh <- ProbeResult{
-						TTL:      ttl,
-						Seq:      seq,
-						IP:       dst.IP.String(),
-						RTT:      rtt,
-						Type:     "tcp-reply",
-						Received: true,
-					}
-					mu.Lock()
-					hop.Reachable = true
-					mu.Unlock()
-					return
-				}
-
-				// 读取 ICMP 响应
-				deadline := time.Now().Add(time.Duration(timeoutMS) * time.Millisecond)
-				for time.Now().Before(deadline) {
-					_ = icmpConn.SetReadDeadline(deadline)
-					buf := make([]byte, 1500)
-					n, peer, err := icmpConn.ReadFrom(buf)
-
-					if err != nil {
-						continue
-					}
-
-					rm, err := icmp.ParseMessage(proto, buf[:n])
-					if err != nil {
-						continue
-					}
-
-					peerIP := stripZone(peer.String())
-
-					// 验证是否是我们的探测包的响应
-					if matchedPort := extractTCPPort(rm, is6); matchedPort == dport {
-						rtt := time.Since(start)
-
-						respType := "unknown"
-						switch rm.Type {
-						case ipv4.ICMPTypeTimeExceeded, ipv6.ICMPTypeTimeExceeded:
-							respType = "ttl-exceeded"
-						case ipv4.ICMPTypeDestinationUnreachable, ipv6.ICMPTypeDestinationUnreachable:
-							respType = "destination"
-						}
-
-						resultsCh <- ProbeResult{
-							TTL:      ttl,
-							Seq:      seq,
-							IP:       peerIP,
-							RTT:      rtt,
-							Type:     respType,
-							Received: true,
-						}
-						return
-					}
-				}
-
-				resultsCh <- ProbeResult{TTL: ttl, Seq: seq, Received: false}
-			}(i)
-		}
-
-		// 收集结果
-		go func() {
-			wg.Wait()
-			close(resultsCh)
-		}()
-
-		for result := range resultsCh {
-			mu.Lock()
+			result := tcpProbe(ctx, dst, basePort, ttl, i, timeoutMS, icmpConn, proto, is6)
 			results = append(results, result)
+
 			if result.Received && result.IP != "" {
 				hopIPs[result.IP]++
 			}
-			mu.Unlock()
+
+			if result.Type == "tcp-reply" || result.Type == "tcp-rst" {
+				hop.Reachable = true
+			}
 		}
 
-		// 处理结果
 		processHopResults(&hop, results, hopIPs)
 
 		select {
@@ -854,50 +754,178 @@ func traceTCP(ctx context.Context, dst *net.IPAddr, basePort uint16, count, time
 	return nil
 }
 
-func extractTCPPort(msg *icmp.Message, is6 bool) uint16 {
-	var origData []byte
+// tcpProbe 发送单个 TCP 探测包并等待响应
+func tcpProbe(ctx context.Context, dst *net.IPAddr, dport uint16, ttl, seq, timeoutMS int, icmpConn *icmp.PacketConn, proto int, is6 bool) ProbeResult {
+	result := ProbeResult{TTL: ttl, Seq: seq, Received: false}
 
-	switch body := msg.Body.(type) {
-	case *icmp.TimeExceeded:
-		origData = body.Data
-	case *icmp.DstUnreach:
-		origData = body.Data
+	// 创建带 TTL 控制的 TCP 连接
+	dialer := &net.Dialer{
+		Timeout: time.Duration(timeoutMS) * time.Millisecond,
+		Control: func(network, address string, c syscall.RawConn) error {
+			var ctrlErr error
+			err := c.Control(func(fd uintptr) {
+				if is6 {
+					ctrlErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_UNICAST_HOPS, ttl)
+				} else {
+					ctrlErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
+				}
+			})
+			if err != nil {
+				return err
+			}
+			return ctrlErr
+		},
+	}
+
+	// 启动 ICMP 监听 goroutine
+	icmpResult := make(chan ProbeResult, 1)
+	icmpDone := make(chan struct{})
+
+	go func() {
+		defer close(icmpResult)
+		deadline := time.Now().Add(time.Duration(timeoutMS) * time.Millisecond)
+
+		for {
+			select {
+			case <-icmpDone:
+				return
+			default:
+			}
+
+			if time.Now().After(deadline) {
+				return
+			}
+
+			_ = icmpConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+			buf := make([]byte, 1500)
+			n, peer, err := icmpConn.ReadFrom(buf)
+
+			if err != nil {
+				continue
+			}
+
+			rm, err := icmp.ParseMessage(proto, buf[:n])
+			if err != nil {
+				continue
+			}
+
+			// 使用改进的端口提取函数验证响应
+			if matchedPort := extractTCPPortFromICMP(rm, is6); matchedPort == dport {
+				peerIP := stripZone(peer.String())
+
+				respType := "unknown"
+				switch rm.Type {
+				case ipv4.ICMPTypeTimeExceeded, ipv6.ICMPTypeTimeExceeded:
+					respType = "ttl-exceeded"
+				case ipv4.ICMPTypeDestinationUnreachable, ipv6.ICMPTypeDestinationUnreachable:
+					respType = "destination"
+				}
+
+				icmpResult <- ProbeResult{
+					TTL:      ttl,
+					Seq:      seq,
+					IP:       peerIP,
+					Type:     respType,
+					Received: true,
+				}
+				return
+			}
+		}
+	}()
+
+	// 构造地址（net.JoinHostPort 自动处理 IPv6）
+	addr := net.JoinHostPort(dst.IP.String(), strconv.Itoa(int(dport)))
+
+	start := time.Now()
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+
+	if err == nil {
+		// TCP 连接成功（SYN-ACK），到达目标且端口开放
+		conn.Close()
+		close(icmpDone)
+		return ProbeResult{
+			TTL:      ttl,
+			Seq:      seq,
+			IP:       dst.IP.String(),
+			RTT:      time.Since(start),
+			Type:     "tcp-reply",
+			Received: true,
+		}
+	}
+
+	// 检查是否是连接被拒绝（RST）- 说明到达目标但端口关闭
+	if isConnectionRefused(err) {
+		close(icmpDone)
+		return ProbeResult{
+			TTL:      ttl,
+			Seq:      seq,
+			IP:       dst.IP.String(),
+			RTT:      time.Since(start),
+			Type:     "tcp-rst",
+			Received: true,
+		}
+	}
+
+	// 等待 ICMP 响应
+	close(icmpDone)
+
+	select {
+	case r, ok := <-icmpResult:
+		if ok && r.Received {
+			r.RTT = time.Since(start)
+			return r
+		}
 	default:
-		return 0
 	}
 
-	if is6 {
-		// IPv6: 跳过IPv6头部（40字节）
-		if len(origData) < 40+8 {
-			return 0
-		}
-		// TCP头部从第40字节开始
-		tcpData := origData[40:]
-		if len(tcpData) >= 4 {
-			return binary.BigEndian.Uint16(tcpData[2:4]) // 目标端口
-		}
-	} else {
-		// IPv4: 跳过IP头部
-		if len(origData) < 20+8 {
-			return 0
-		}
-		ipHdrLen := int((origData[0] & 0x0f) * 4)
-		if len(origData) < ipHdrLen+8 {
-			return 0
-		}
-		// TCP头部
-		tcpData := origData[ipHdrLen:]
-		if len(tcpData) >= 4 {
-			return binary.BigEndian.Uint16(tcpData[2:4]) // 目标端口
+	// 再等待剩余时间
+	remaining := time.Duration(timeoutMS)*time.Millisecond - time.Since(start)
+	if remaining > 0 {
+		select {
+		case r, ok := <-icmpResult:
+			if ok && r.Received {
+				r.RTT = time.Since(start)
+				return r
+			}
+		case <-time.After(remaining):
+		case <-ctx.Done():
 		}
 	}
 
-	return 0
+	return result
+}
+
+// isConnectionRefused 检查错误是否为连接被拒绝
+func isConnectionRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// 检查 syscall 错误
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		var syscallErr *os.SyscallError
+		if errors.As(opErr.Err, &syscallErr) {
+			if syscallErr.Err == syscall.ECONNREFUSED {
+				return true
+			}
+		}
+		// 直接检查 syscall.Errno
+		var errno syscall.Errno
+		if errors.As(opErr.Err, &errno) {
+			return errno == syscall.ECONNREFUSED
+		}
+	}
+
+	// 检查错误消息
+	errStr := err.Error()
+	return strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "refused")
 }
 
 // =================== ICMP 响应解析 ===================
 
-// 改进的TCP端口提取函数
+// extractTCPPortFromICMP 从 ICMP 错误消息中提取原始 TCP 包的目标端口
 func extractTCPPortFromICMP(msg *icmp.Message, is6 bool) uint16 {
 	if msg == nil {
 		return 0
@@ -1084,10 +1112,13 @@ func processHopResults(hop *HopStat, results []ProbeResult, hopIPs map[string]in
 			geo, as := geoDB.Lookup(ip)
 			hop.Geos = append(hop.Geos, geo)
 			hop.ASes = append(hop.ASes, as)
+			// 识别网络类型
+			hop.NetworkTypes = append(hop.NetworkTypes, identifyNetworkType(item.ip, as))
 		} else {
 			hop.Hostnames = append(hop.Hostnames, "*")
 			hop.Geos = append(hop.Geos, "*")
 			hop.ASes = append(hop.ASes, "*")
+			hop.NetworkTypes = append(hop.NetworkTypes, "")
 		}
 	}
 
@@ -1124,6 +1155,375 @@ func lookupHostname(ip net.IP) string {
 	hostname := strings.TrimSuffix(names[0], ".")
 	dnsCache.Store(ipStr, hostname)
 	return hostname
+}
+
+// =================== 网络类型识别 ===================
+
+// identifyNetworkType 识别网络类型（CN2 GIA、CN2 GT、163 骨干网等）
+// CN2 GIA: 国内国外全程 59.43 节点 (AS4809)
+// CN2 GT: 国外 59.43，国内 202.97 (AS4134)
+// 163: 国内 202.97 骨干网 (AS4134)
+// AS9929: 联通精品网，对标 CN2 GIA
+// AS4837: 联通普通骨干网，对标 163
+// CUVIP: 走圣何塞出口的 AS4837，速度快
+func identifyNetworkType(ip string, asInfo string) string {
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return ""
+	}
+
+	ipv4 := parsedIP.To4()
+	if ipv4 == nil {
+		return ""
+	}
+
+	asNum := extractASNumber(asInfo)
+
+	// ========== 中国电信 ==========
+	// AS4809 - CN2 网络
+	if asNum == 4809 {
+		// 59.43.x.x 是 CN2 的核心节点
+		if ipv4[0] == 59 && ipv4[1] == 43 {
+			return "CN2"
+		}
+		return "CN2"
+	}
+
+	// AS4134 - 电信 163 骨干网
+	if asNum == 4134 {
+		// 202.97.x.x 是 163 骨干网核心节点
+		if ipv4[0] == 202 && ipv4[1] == 97 {
+			return "163"
+		}
+		return "ChinaNet"
+	}
+
+	// ========== 中国联通 ==========
+	// AS9929 - 联通 A 网/精品网，对标 CN2 GIA
+	// 特征 IP: 218.105.x.x / 210.51.x.x
+	if asNum == 9929 {
+		return "AS9929"
+	}
+
+	// AS4837 - 联通普通骨干网，对标 163
+	if asNum == 4837 {
+		return "AS4837"
+	}
+
+	// AS10099 - 联通国际
+	if asNum == 10099 {
+		return "CU-Intl"
+	}
+
+	// ========== 中国移动 ==========
+	// AS58807 - 移动国际精品网 CMIN2
+	if asNum == 58807 {
+		return "CMIN2"
+	}
+
+	// AS9808 - 移动骨干网
+	if asNum == 9808 {
+		return "CMI"
+	}
+
+	// AS58453 - 移动国际
+	if asNum == 58453 {
+		return "CMI-Intl"
+	}
+
+	// ========== 国际运营商 ==========
+	switch asNum {
+	// Tier 1 运营商
+	case 174:
+		return "Cogent"
+	case 3356:
+		return "Lumen"
+	case 6939:
+		return "HE"
+	case 1299:
+		return "Telia"
+	case 2914:
+		return "NTT"
+	case 3257:
+		return "GTT"
+	case 6461:
+		return "Zayo"
+	case 7018:
+		return "AT&T"
+	case 701:
+		return "Verizon"
+	case 3491:
+		return "PCCW"
+	case 4637:
+		return "Telstra"
+	case 2516:
+		return "KDDI"
+	case 9299:
+		return "IPG"
+
+	// 云服务商
+	case 13335:
+		return "Cloudflare"
+	case 16509:
+		return "AWS"
+	case 15169:
+		return "Google"
+	case 8075:
+		return "Microsoft"
+	case 32934:
+		return "Meta"
+	case 14618:
+		return "AWS"
+	case 54113:
+		return "Fastly"
+	case 20940:
+		return "Akamai"
+
+	// 香港/亚太
+	case 4515:
+		return "HKT"
+	case 9304:
+		return "HGC"
+	case 9269:
+		return "HKBN"
+	case 4760:
+		return "HKT-Intl"
+	case 38008:
+		return "Equinix-HK"
+
+	// 日本
+	case 2497:
+		return "IIJ"
+	case 4713:
+		return "OCN"
+	case 17676:
+		return "SoftBank"
+
+	// 韩国
+	case 4766:
+		return "KT"
+	case 9318:
+		return "SKB"
+	case 3786:
+		return "LGU+"
+
+	// 台湾
+	case 3462:
+		return "HINET"
+	case 9924:
+		return "TWM"
+
+	// 新加坡
+	case 7473:
+		return "Singtel"
+	case 4657:
+		return "StarHub"
+
+	// ========== 云服务商（补充） ==========
+	case 31898:
+		return "Oracle"
+	case 14061:
+		return "DigitalOcean"
+	case 20473:
+		return "Vultr"
+	case 63949:
+		return "Linode"
+	case 16276:
+		return "OVH"
+	case 24940:
+		return "Hetzner"
+	case 45102:
+		return "Alibaba"
+	case 132203:
+		return "Tencent"
+	case 37963:
+		return "Alibaba-CN"
+	case 45090:
+		return "Tencent-CN"
+	case 55990:
+		return "Huawei"
+	case 136907:
+		return "Huawei-Cloud"
+	case 21859:
+		return "Zenlayer"
+	case 59919:
+		return "Cloudflare-CN"
+
+	// ========== 欧洲运营商 ==========
+	case 3320:
+		return "DTAG"
+	case 5511:
+		return "Orange"
+	case 5400:
+		return "BT"
+	case 3209:
+		return "Vodafone"
+	case 6830:
+		return "Liberty"
+	case 1273:
+		return "Vodafone-UK"
+	case 6453:
+		return "TATA"
+	case 6762:
+		return "Sparkle"
+	case 12956:
+		return "Telefonica"
+	case 8220:
+		return "COLT"
+
+	// ========== 俄罗斯/东欧 ==========
+	case 12389:
+		return "Rostelecom"
+	case 20485:
+		return "TransTelekom"
+	case 31133:
+		return "MegaFon"
+
+	// ========== 东南亚 ==========
+	case 45899:
+		return "VNPT"
+	case 7713:
+		return "Telkom-ID"
+	case 17974:
+		return "Telkom-Intl"
+	case 4788:
+		return "TM-MY"
+	case 4818:
+		return "DiGi"
+	case 23969:
+		return "TOT"
+	case 38040:
+		return "CAT"
+	case 132280:
+		return "VNPT-Intl"
+
+	// ========== 印度 ==========
+	case 9498:
+		return "BSNL"
+	case 55836:
+		return "Reliance"
+	case 18101:
+		return "Reliance-Jio"
+	case 45609:
+		return "Airtel-IN"
+	case 17488:
+		return "Hathway"
+
+	// ========== 中东 ==========
+	case 8966:
+		return "Etisalat"
+	case 5384:
+		return "STC"
+	case 39891:
+		return "STC-Intl"
+	case 8781:
+		return "Ooredoo"
+
+	// ========== CDN ==========
+	case 200325:
+		return "BunnyCDN"
+	case 33438:
+		return "StackPath"
+	case 30148:
+		return "Sucuri"
+	case 19551:
+		return "Incapsula"
+	case 209242:
+		return "CloudflareCN"
+	case 395747:
+		return "QUIC.cloud"
+	case 132892:
+		return "Cloudflare-AP"
+
+	// ========== 游戏/专线 ==========
+	case 57976:
+		return "Blizzard"
+	case 46489:
+		return "Twitch"
+	case 36459:
+		return "GitHub"
+	case 8068:
+		return "Microsoft-CDN"
+	case 8069:
+		return "Microsoft-CDN"
+	case 6185:
+		return "Apple"
+	case 714:
+		return "Apple"
+	case 20446:
+		return "Amazon-Video"
+
+	// ========== 其他亚太 ==========
+	case 17858:
+		return "LG-Dacom"
+	case 9644:
+		return "SK-Intl"
+	case 10026:
+		return "Pacnet"
+	case 18403:
+		return "FPT"
+	case 131429:
+		return "FPT-Intl"
+	case 24203:
+		return "HostHatch"
+	case 138997:
+		return "Eons"
+	case 141995:
+		return "Eons-HK"
+
+	// ========== 澳洲/新西兰 ==========
+	case 1221:
+		return "Telstra-AU"
+	case 4826:
+		return "Vocus"
+	case 7545:
+		return "TPG"
+	case 9790:
+		return "Spark-NZ"
+	case 4771:
+		return "Optus"
+
+	// ========== 教育网/科研网 ==========
+	case 4538:
+		return "CERNET"
+	case 23910:
+		return "CERNET2"
+	case 4812:
+		return "ChinaNet-SH"
+	case 17816:
+		return "CSTNET"
+	}
+
+	return ""
+}
+
+// extractASNumber 从 AS 信息字符串中提取 AS 号
+func extractASNumber(asInfo string) int {
+	if asInfo == "" || asInfo == "*" {
+		return 0
+	}
+
+	// 查找 "AS" 后面的数字
+	idx := strings.Index(strings.ToUpper(asInfo), "AS")
+	if idx == -1 {
+		return 0
+	}
+
+	numStr := ""
+	for i := idx + 2; i < len(asInfo); i++ {
+		if asInfo[i] >= '0' && asInfo[i] <= '9' {
+			numStr += string(asInfo[i])
+		} else {
+			break
+		}
+	}
+
+	if numStr == "" {
+		return 0
+	}
+
+	num, _ := strconv.Atoi(numStr)
+	return num
 }
 
 // =================== 工具函数 ===================

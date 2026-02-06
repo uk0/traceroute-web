@@ -2,22 +2,27 @@
 <html lang="zh-CN">
 <head>
     <meta charset="utf-8">
-    <title>在线路由追踪工具 · 纯 Go 实现</title>
+    <title>TraceRoute - 在线路由追踪工具</title>
     <link rel="stylesheet" href="/static/app.css">
     <meta name="viewport" content="width=device-width, initial-scale=1">
 </head>
 <body>
 <div class="container">
-    <h1>🌐 在线路由追踪工具</h1>
-    <h3>TraceRoute不一定会完全追踪到目标IP，受到网络环境影响。</h3>
-    <h3>结果对比推荐：<a href="https://tools.ipip.net/traceroute.php">IPIP TraceRoute</a></h3>
+    <h1>TraceRoute</h1>
+    <p class="subtitle">
+        在线路由追踪工具 · 支持 CN2/GIA 线路识别 ·
+        <a href="https://tools.ipip.net/traceroute.php" target="_blank">IPIP 对比参考</a>
+    </p>
+
     <div class="card">
         <form method="post" action="/trace">
             <div class="form-section">
                 <h3>基本设置</h3>
                 <div class="row">
-                    <label>目标地址</label>
-                    <input name="target" placeholder="域名或IP，如 google.com / 8.8.8.8" required autofocus>
+                    <div style="flex:1">
+                        <label>目标地址</label>
+                        <input name="target" placeholder="域名或 IP，如 google.com / 8.8.8.8" required autofocus>
+                    </div>
                 </div>
                 <div class="row g">
                     <div>
@@ -25,9 +30,9 @@
                         <select name="mode" id="modeSelect">
                             <option value="icmp">ICMP (推荐)</option>
                             <option value="udp">UDP</option>
-                            <option value="tcp">TCP (需要root)</option>
+                            <option value="tcp">TCP (需要 root)</option>
                         </select>
-                        <span class="hint">ICMP 最准确，UDP 兼容性好</span>
+                        <span class="hint">ICMP 最准确，UDP 兼容性好，TCP 可穿透防火墙</span>
                     </div>
                 </div>
             </div>
@@ -36,7 +41,7 @@
                 <h3>高级选项</h3>
                 <div class="row g">
                     <div>
-                        <label>起始端口</label>
+                        <label>目标端口</label>
                         <input type="number" name="dport" id="dportInput" min="1" max="65535" value="33434">
                         <span class="hint">UDP/TCP 模式使用</span>
                     </div>
@@ -51,7 +56,7 @@
                         <span class="hint">建议 3 次</span>
                     </div>
                     <div>
-                        <label>单跳超时(ms)</label>
+                        <label>单跳超时 (ms)</label>
                         <input type="number" name="timeout" min="300" max="3000" value="{{.defaultTimeout}}">
                         <span class="hint">建议 800ms</span>
                     </div>
@@ -59,23 +64,27 @@
             </div>
 
             <div class="row submit-row">
-                <button type="submit" class="btn-primary">🚀 开始追踪</button>
+                <button type="submit" class="btn-primary">开始追踪</button>
                 <button type="button" class="btn-secondary" onclick="resetForm()">重置</button>
             </div>
         </form>
 
         {{if .tcpNeedRoot}}
         <div class="warning">
-            ⚠️ TCP 模式需要 root 权限或 CAP_NET_RAW 能力
+            TCP 模式需要 root 权限或 CAP_NET_RAW 能力
         </div>
         {{end}}
 
         <div class="info-box">
-            <h4>说明：</h4>
+            <h4>线路类型说明</h4>
             <ul>
-                <li><strong>ICMP 模式</strong>：最标准的 traceroute 方式，结果最准确</li>
-                <li><strong>UDP 模式</strong>：使用 UDP 数据包，适用于 ICMP 被过滤的网络</li>
-                <li><strong>TCP 模式</strong>：使用 TCP SYN 包，可穿透某些防火墙</li>
+                <li><strong>CN2 GIA</strong> - 电信精品网，国内外全程 59.43 节点 (AS4809)，速度最快，价格最贵</li>
+                <li><strong>CN2 GT</strong> - 电信 CN2，出国走 59.43，回国走 202.97，中等质量</li>
+                <li><strong>163</strong> - 电信骨干网 202.97 (AS4134)，普通家用线路，晚高峰拥堵</li>
+                <li><strong>AS9929</strong> - 联通精品网 (218.105/210.51)，对标 CN2 GIA，负载低速度快</li>
+                <li><strong>AS4837</strong> - 联通骨干网，普通家用线路，对标电信 163</li>
+                <li><strong>CMIN2</strong> - 移动国际精品网 (AS58807)，质量较好</li>
+                <li><strong>CMI</strong> - 移动国际 (AS9808)，普通移动线路</li>
             </ul>
         </div>
     </div>
@@ -86,9 +95,9 @@
         const mode = this.value;
         const dportInput = document.getElementById('dportInput');
         if (mode === 'tcp') {
-            dportInput.value = '80';  // TCP 默认 80 端口
+            dportInput.value = '80';
         } else if (mode === 'udp') {
-            dportInput.value = '33434';  // UDP 默认 33434
+            dportInput.value = '33434';
         }
     });
 

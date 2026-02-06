@@ -2,16 +2,36 @@
 <html lang="zh-CN">
 <head>
     <meta charset="utf-8">
-    <title>追踪中…</title>
+    <title>追踪结果 - TraceRoute</title>
     <link rel="stylesheet" href="/static/app.css">
     <meta name="viewport" content="width=device-width, initial-scale=1">
 </head>
 <body>
 <div class="container">
-    <h1>追踪结果：<span id="title"></span></h1>
-    <div class="meta">
-        <span>模式：<span id="mode"></span></span>
-        <span id="dportWrap" style="display:none;">目的端口：<span id="dport"></span></span>
+    <div class="result-header">
+        <h1>追踪结果</h1>
+        <div class="meta">
+            <div class="meta-item">目标：<span id="title"></span></div>
+            <div class="meta-item">模式：<span id="mode"></span></div>
+            <div class="meta-item" id="dportWrap" style="display:none">端口：<span id="dport"></span></div>
+        </div>
+    </div>
+
+    <!-- 线路质量分析 -->
+    <div class="route-analysis" id="routeAnalysis" style="display:none">
+        <div class="analysis-title">线路质量分析</div>
+        <div class="analysis-content" id="analysisContent"></div>
+    </div>
+
+    <div class="network-legend" id="legend" style="display:none">
+        <div class="legend-title">网络类型图例</div>
+        <div class="legend-item"><span class="legend-dot" style="background:#22c55e"></span>CN2 (59.43)</div>
+        <div class="legend-item"><span class="legend-dot" style="background:#f59e0b"></span>163 (202.97)</div>
+        <div class="legend-item"><span class="legend-dot" style="background:#06b6d4"></span>AS9929 联通精品</div>
+        <div class="legend-item"><span class="legend-dot" style="background:#3b82f6"></span>AS4837 联通骨干</div>
+        <div class="legend-item"><span class="legend-dot" style="background:#a855f7"></span>CMIN2 移动精品</div>
+        <div class="legend-item"><span class="legend-dot" style="background:#8b5cf6"></span>CMI 移动</div>
+        <div class="legend-item"><span class="legend-dot" style="background:#6366f1"></span>国际线路</div>
     </div>
 
     <div class="table-wrap">
@@ -20,172 +40,475 @@
             <tr>
                 <th>跳数</th>
                 <th>IP</th>
+                <th>网络</th>
                 <th>主机名</th>
-                <th>地区（仅供参考）</th>
-                <th>AS号（仅供参考）</th>
-                <th>丢包率</th>
+                <th>地区</th>
+                <th>AS</th>
+                <th>丢包</th>
                 <th>发送</th>
-                <th>最新(ms)</th>
-                <th>最快(ms)</th>
-                <th>最慢(ms)</th>
-                <th>平均(ms)</th>
+                <th>最新</th>
+                <th>最快</th>
+                <th>最慢</th>
+                <th>平均</th>
             </tr>
             </thead>
             <tbody></tbody>
         </table>
     </div>
 
-    <p><a href="/">再测一个</a></p>
+    <a href="/" class="back-link">← 返回首页</a>
 </div>
 
 <script>
-    (function(){
-        const q = new URLSearchParams(location.search);
-        const target = q.get('target') || '{{.Target}}';
-        const mode = q.get('mode') || '{{.Mode}}';
-        const dport = q.get('dport') || '{{.DPort}}';
-        const maxhops = q.get('maxhops') || '{{.MaxHops}}';
-        const count = q.get('count') || '{{.Count}}';
-        const timeout = q.get('timeout') || '{{.Timeout}}';
+(function(){
+    const q = new URLSearchParams(location.search);
+    const target = q.get('target') || '{{.Target}}';
+    const mode = q.get('mode') || '{{.Mode}}';
+    const dport = q.get('dport') || '{{.DPort}}';
+    const maxhops = q.get('maxhops') || '{{.MaxHops}}';
+    const count = q.get('count') || '{{.Count}}';
+    const timeout = q.get('timeout') || '{{.Timeout}}';
 
-        document.getElementById('title').textContent = target;
-        document.getElementById('mode').textContent = mode;
-        if (mode === 'tcp' || mode === 'udp') {
-            document.getElementById('dportWrap').style.display = 'inline';
-            document.getElementById('dport').textContent = dport;
+    document.getElementById('title').textContent = target;
+    document.getElementById('mode').textContent = mode.toUpperCase();
+    if (mode === 'tcp' || mode === 'udp') {
+        document.getElementById('dportWrap').style.display = 'flex';
+        document.getElementById('dport').textContent = dport;
+    }
+
+    const tbody = document.querySelector('#tbl tbody');
+    const rows = new Map();
+    const networkTypesFound = new Set();
+    const allHops = new Map(); // 存储所有跳数据用于分析
+
+    function fmtPct(n) {
+        if (n == null || isNaN(n)) return '--';
+        return Math.round(n) + '%';
+    }
+
+    function getLossClass(pct) {
+        if (pct == null || isNaN(pct)) return '';
+        if (pct === 0) return 'loss-good';
+        if (pct < 20) return 'loss-warn';
+        return 'loss-bad';
+    }
+
+    function highlightAS(asText) {
+        if (!asText || asText === '--' || asText === '*') return asText;
+        return asText.replace(/(AS\d+)/g, '<span class="as-highlight">$1</span>');
+    }
+
+    function getNetworkTagClass(type) {
+        if (!type) return '';
+        const t = type.toLowerCase().replace(/[^a-z0-9]/g, '-');
+        const classMap = {
+            // 中国电信
+            'cn2': 'cn2',
+            'cn2-gia': 'cn2-gia',
+            'cn2-gt': 'cn2-gt',
+            '163': 'cn163',
+            'chinanet': 'chinanet',
+            // 中国移动
+            'cmi': 'cmi',
+            'cmi-intl': 'cmi',
+            'cmin2': 'cmin2',
+            // 中国联通
+            'as4837': 'cu',
+            'as9929': 'cu-vip',
+            'cu-intl': 'cu',
+            // 教育网
+            'cernet': 'edu',
+            'cernet2': 'edu',
+            'cstnet': 'edu',
+            'chinanet-sh': 'chinanet',
+            // Tier 1 国际
+            'cogent': 'intl',
+            'lumen': 'intl',
+            'he': 'intl',
+            'telia': 'intl',
+            'ntt': 'intl',
+            'gtt': 'intl',
+            'zayo': 'intl',
+            'at-t': 'intl',
+            'verizon': 'intl',
+            'pccw': 'intl',
+            'telstra': 'intl',
+            'telstra-au': 'intl',
+            'kddi': 'intl',
+            'ipg': 'intl',
+            'tata': 'intl',
+            'sparkle': 'intl',
+            'telefonica': 'intl',
+            'colt': 'intl',
+            // 云服务商
+            'cloudflare': 'cloud',
+            'cloudflare-cn': 'cloud',
+            'cloudflare-ap': 'cloud',
+            'cloudflarecn': 'cloud',
+            'aws': 'cloud',
+            'google': 'cloud',
+            'microsoft': 'cloud',
+            'microsoft-cdn': 'cloud',
+            'meta': 'cloud',
+            'fastly': 'cloud',
+            'akamai': 'cloud',
+            'oracle': 'cloud',
+            'digitalocean': 'cloud',
+            'vultr': 'cloud',
+            'linode': 'cloud',
+            'ovh': 'cloud',
+            'hetzner': 'cloud',
+            'alibaba': 'cloud-cn',
+            'alibaba-cn': 'cloud-cn',
+            'tencent': 'cloud-cn',
+            'tencent-cn': 'cloud-cn',
+            'huawei': 'cloud-cn',
+            'huawei-cloud': 'cloud-cn',
+            'zenlayer': 'cloud',
+            // CDN
+            'bunnycdn': 'cdn',
+            'stackpath': 'cdn',
+            'sucuri': 'cdn',
+            'incapsula': 'cdn',
+            'quic-cloud': 'cdn',
+            // 香港
+            'hkt': 'hk',
+            'hgc': 'hk',
+            'hkbn': 'hk',
+            'hkt-intl': 'hk',
+            'equinix-hk': 'hk',
+            'eons': 'hk',
+            'eons-hk': 'hk',
+            // 日本
+            'iij': 'jp',
+            'ocn': 'jp',
+            'softbank': 'jp',
+            // 韩国
+            'kt': 'kr',
+            'skb': 'kr',
+            'lgu-': 'kr',
+            'lg-dacom': 'kr',
+            'sk-intl': 'kr',
+            // 台湾
+            'hinet': 'tw',
+            'twm': 'tw',
+            // 新加坡
+            'singtel': 'sg',
+            'starhub': 'sg',
+            // 东南亚
+            'vnpt': 'sea',
+            'vnpt-intl': 'sea',
+            'telkom-id': 'sea',
+            'telkom-intl': 'sea',
+            'pldt': 'sea',
+            'tm-my': 'sea',
+            'digi': 'sea',
+            'tot': 'sea',
+            'cat': 'sea',
+            'fpt': 'sea',
+            'fpt-intl': 'sea',
+            // 印度
+            'bsnl': 'in',
+            'reliance': 'in',
+            'reliance-jio': 'in',
+            'airtel-in': 'in',
+            'hathway': 'in',
+            // 欧洲
+            'dtag': 'eu',
+            'orange': 'eu',
+            'bt': 'eu',
+            'vodafone': 'eu',
+            'vodafone-uk': 'eu',
+            'liberty': 'eu',
+            // 俄罗斯
+            'rostelecom': 'ru',
+            'transtelecom': 'ru',
+            'megafon': 'ru',
+            // 中东
+            'etisalat': 'me',
+            'stc': 'me',
+            'stc-intl': 'me',
+            'ooredoo': 'me',
+            // 澳新
+            'vocus': 'au',
+            'tpg': 'au',
+            'spark-nz': 'au',
+            'optus': 'au',
+            // 游戏/专线
+            'blizzard': 'game',
+            'twitch': 'game',
+            'github': 'cloud',
+            'apple': 'cloud',
+            'amazon-video': 'cloud',
+            // 其他
+            'pacnet': 'intl',
+            'hosthatch': 'cloud'
+        };
+        return classMap[t] || 'intl';
+    }
+
+    function formatNetworkType(type) {
+        if (!type) return '--';
+        networkTypesFound.add(type);
+        updateLegend();
+        const cls = getNetworkTagClass(type);
+        return `<span class="network-tag ${cls}">${type}</span>`;
+    }
+
+    function formatMultipleValues(arr) {
+        if (!arr || arr.length === 0) return '--';
+        if (arr.length === 1) return arr[0] || '--';
+        return arr.map(item => `<div class="multi-item">${item || '--'}</div>`).join('');
+    }
+
+    function formatMultipleIPs(ips) {
+        if (!ips || ips.length === 0) return '--';
+        if (ips.length === 1) return ips[0];
+        return ips.map(ip => `<div class="multi-item ip-item">${ip}</div>`).join('');
+    }
+
+    function formatMultipleAS(ases) {
+        if (!ases || ases.length === 0) return '--';
+        if (ases.length === 1) return highlightAS(ases[0]);
+        return ases.map(as => `<div class="multi-item">${highlightAS(as)}</div>`).join('');
+    }
+
+    function formatMultipleNetworks(types) {
+        if (!types || types.length === 0) return '--';
+        if (types.length === 1) return formatNetworkType(types[0]);
+        return types.map(t => `<div class="multi-item">${formatNetworkType(t)}</div>`).join('');
+    }
+
+    function updateLegend() {
+        if (networkTypesFound.size > 0) {
+            document.getElementById('legend').style.display = 'flex';
+        }
+    }
+
+    // 分析路由路径，判断线路质量
+    function analyzeRoute() {
+        const types = [];
+        const sortedHops = Array.from(allHops.entries()).sort((a, b) => a[0] - b[0]);
+
+        for (const [hop, data] of sortedHops) {
+            if (data.network_types) {
+                types.push(...data.network_types.filter(t => t));
+            }
         }
 
-        const tbody = document.querySelector('#tbl tbody');
-        const rows = new Map();
+        if (types.length === 0) return;
 
-        function fmtPct(n){
-            if (n == null || isNaN(n)) return '--';
-            return Math.round(n) + '%';
+        const hasCN2 = types.includes('CN2');
+        const has163 = types.includes('163') || types.includes('ChinaNet');
+        const hasAS9929 = types.includes('AS9929');
+        const hasAS4837 = types.includes('AS4837');
+        const hasCMIN2 = types.includes('CMIN2');
+        const hasCMI = types.includes('CMI');
+
+        let analysis = [];
+        let quality = '';
+
+        // 电信线路分析
+        if (hasCN2 && !has163) {
+            analysis.push({
+                type: 'cn2-gia',
+                label: 'CN2 GIA',
+                desc: '全程 CN2 (59.43)，电信精品线路，速度最快'
+            });
+            quality = 'excellent';
+        } else if (hasCN2 && has163) {
+            analysis.push({
+                type: 'cn2-gt',
+                label: 'CN2 GT',
+                desc: '出国 CN2 (59.43)，回国 163 (202.97)，中等质量'
+            });
+            quality = 'good';
+        } else if (has163 && !hasCN2) {
+            analysis.push({
+                type: '163',
+                label: '163 骨干网',
+                desc: '电信普通线路 (202.97)，晚高峰可能拥堵'
+            });
+            quality = 'normal';
         }
 
-        function highlightAS(asText) {
-            if (!asText || asText === '--') return asText;
-            return asText.replace(/(AS\d+)/g, '<span class="as-highlight">$1</span>');
+        // 联通线路分析
+        if (hasAS9929) {
+            analysis.push({
+                type: 'as9929',
+                label: 'AS9929 联通精品',
+                desc: '联通 A 网，对标 CN2 GIA，负载低速度快'
+            });
+            quality = quality || 'excellent';
+        } else if (hasAS4837) {
+            analysis.push({
+                type: 'as4837',
+                label: 'AS4837 联通骨干',
+                desc: '联通普通线路，对标电信 163'
+            });
+            quality = quality || 'normal';
         }
 
-        function formatMultipleValues(arr) {
-            if (!arr || arr.length === 0) return '--';
-            if (arr.length === 1) return arr[0];
-            return arr.map((item, idx) => `<div class="multi-item">${item}</div>`).join('');
+        // 移动线路分析
+        if (hasCMIN2) {
+            analysis.push({
+                type: 'cmin2',
+                label: 'CMIN2 移动精品',
+                desc: '移动国际精品网 (AS58807)，质量较好'
+            });
+            quality = quality || 'good';
+        } else if (hasCMI) {
+            analysis.push({
+                type: 'cmi',
+                label: 'CMI 移动',
+                desc: '移动国际线路 (AS9808)'
+            });
+            quality = quality || 'normal';
         }
 
-        function formatMultipleIPs(ips) {
-            if (!ips || ips.length === 0) return '--';
-            if (ips.length === 1) return ips[0];
-            return ips.map((ip, idx) => `<div class="multi-item ip-item">${ip}</div>`).join('');
+        if (analysis.length === 0) return;
+
+        const container = document.getElementById('routeAnalysis');
+        const content = document.getElementById('analysisContent');
+
+        let html = analysis.map(a => `
+            <div class="analysis-item ${a.type}">
+                <span class="analysis-label">${a.label}</span>
+                <span class="analysis-desc">${a.desc}</span>
+            </div>
+        `).join('');
+
+        // 添加质量评级
+        const qualityLabels = {
+            'excellent': { text: '优秀', class: 'quality-excellent' },
+            'good': { text: '良好', class: 'quality-good' },
+            'normal': { text: '普通', class: 'quality-normal' }
+        };
+
+        if (quality && qualityLabels[quality]) {
+            html += `<div class="quality-badge ${qualityLabels[quality].class}">
+                线路质量：${qualityLabels[quality].text}
+            </div>`;
         }
 
-        function formatMultipleAS(ases) {
-            if (!ases || ases.length === 0) return '--';
-            if (ases.length === 1) return highlightAS(ases[0]);
-            return ases.map((as, idx) => `<div class="multi-item">${highlightAS(as)}</div>`).join('');
+        content.innerHTML = html;
+        container.style.display = 'block';
+    }
+
+    function addOrUpdateRow(h) {
+        // 存储数据用于分析
+        allHops.set(h.hop, h);
+
+        let tr = rows.get(h.hop);
+        let isNewRow = false;
+
+        if (!tr) {
+            tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td class="hop"></td>
+                <td class="ip">--</td>
+                <td class="network">--</td>
+                <td class="hostname">--</td>
+                <td class="geo">--</td>
+                <td class="asn">--</td>
+                <td class="loss">--</td>
+                <td class="sent">--</td>
+                <td class="last">--</td>
+                <td class="best">--</td>
+                <td class="worst">--</td>
+                <td class="avg">--</td>
+            `;
+            tbody.appendChild(tr);
+            rows.set(h.hop, tr);
+            isNewRow = true;
         }
 
-        function addOrUpdateRow(h){
-            let tr = rows.get(h.hop);
-            let isNewRow = false;
+        const shouldUpdate = isNewRow ||
+            h.reachable ||
+            (h.ips && h.ips.length > 0 && tr.querySelector('.ip').textContent === '--');
 
-            if (!tr) {
-                tr = document.createElement('tr');
-                tr.innerHTML = `
-        <td class="hop"></td>
-        <td class="ip">--</td>
-        <td class="hostname">--</td>
-        <td class="geo">--</td>
-        <td class="asn">--</td>
-        <td class="loss">--</td>
-        <td class="sent">--</td>
-        <td class="last">--</td>
-        <td class="best">--</td>
-        <td class="worst">--</td>
-        <td class="avg">--</td>
-      `;
-                tbody.appendChild(tr);
-                rows.set(h.hop, tr);
-                isNewRow = true;
+        if (shouldUpdate) {
+            tr.querySelector('.hop').textContent = h.hop;
+
+            if (h.ips && h.ips.length > 0) {
+                tr.querySelector('.ip').innerHTML = formatMultipleIPs(h.ips);
+            } else {
+                tr.querySelector('.ip').textContent = '--';
             }
 
-            // 如果这一跳已经标记为可达，或者新数据有IP而旧数据没有，则更新
-            const shouldUpdate = isNewRow ||
-                h.reachable ||
-                (h.ips && h.ips.length > 0 && tr.querySelector('.ip').textContent === '--');
+            if (h.network_types && h.network_types.length > 0) {
+                tr.querySelector('.network').innerHTML = formatMultipleNetworks(h.network_types);
+            } else {
+                tr.querySelector('.network').textContent = '--';
+            }
 
-            if (shouldUpdate) {
-                tr.querySelector('.hop').textContent = h.hop;
+            if (h.hostnames && h.hostnames.length > 0) {
+                tr.querySelector('.hostname').innerHTML = formatMultipleValues(h.hostnames);
+            } else {
+                tr.querySelector('.hostname').textContent = '--';
+            }
 
-                // 处理多个 IP 的情况
-                if (h.ips && h.ips.length > 0) {
-                    tr.querySelector('.ip').innerHTML = formatMultipleIPs(h.ips);
-                } else {
-                    tr.querySelector('.ip').textContent = '--';
-                }
+            if (h.geos && h.geos.length > 0) {
+                tr.querySelector('.geo').innerHTML = formatMultipleValues(h.geos);
+            } else {
+                tr.querySelector('.geo').textContent = '--';
+            }
 
-                // 处理多个主机名的情况
-                if (h.hostnames && h.hostnames.length > 0) {
-                    tr.querySelector('.hostname').innerHTML = formatMultipleValues(h.hostnames);
-                } else {
-                    tr.querySelector('.hostname').textContent = '--';
-                }
+            if (h.ases && h.ases.length > 0) {
+                tr.querySelector('.asn').innerHTML = formatMultipleAS(h.ases);
+            } else {
+                tr.querySelector('.asn').innerHTML = '--';
+            }
 
-                // 处理多个地理位置的情况
-                if (h.geos && h.geos.length > 0) {
-                    tr.querySelector('.geo').innerHTML = formatMultipleValues(h.geos);
-                } else {
-                    tr.querySelector('.geo').textContent = '--';
-                }
+            const lossPct = h.loss_pct;
+            tr.querySelector('.loss').textContent = fmtPct(lossPct);
+            tr.querySelector('.loss').className = 'loss ' + getLossClass(lossPct);
 
-                // 处理多个 AS 的情况
-                if (h.ases && h.ases.length > 0) {
-                    tr.querySelector('.asn').innerHTML = formatMultipleAS(h.ases);
-                } else {
-                    tr.querySelector('.asn').innerHTML = '--';
-                }
+            tr.querySelector('.sent').textContent = h.sent || 0;
+            tr.querySelector('.last').textContent = h.last_ms != null ? h.last_ms + 'ms' : '--';
+            tr.querySelector('.best').textContent = h.best_ms != null ? h.best_ms + 'ms' : '--';
+            tr.querySelector('.worst').textContent = h.worst_ms != null ? h.worst_ms + 'ms' : '--';
+            tr.querySelector('.avg').textContent = h.avg_ms != null ? h.avg_ms + 'ms' : '--';
 
-                tr.querySelector('.loss').textContent = fmtPct(h.loss_pct);
-                tr.querySelector('.sent').textContent = h.sent || 0;
-                tr.querySelector('.last').textContent = h.last_ms || '--';
-                tr.querySelector('.best').textContent = h.best_ms || '--';
-                tr.querySelector('.worst').textContent = h.worst_ms || '--';
-                tr.querySelector('.avg').textContent = h.avg_ms || '--';
+            tr.classList.remove('dim', 'reachable', 'unreachable');
 
-                // 移除旧的样式
-                tr.classList.remove('dim', 'reachable', 'unreachable');
-
-                // 添加新的样式
-                if (h.reachable) {
-                    tr.classList.add('reachable');
-                } else if (!h.ips || h.ips.length === 0) {
-                    tr.classList.add('dim');
-                } else {
-                    tr.classList.add('unreachable');
-                }
+            if (h.reachable) {
+                tr.classList.add('reachable');
+            } else if (!h.ips || h.ips.length === 0) {
+                tr.classList.add('dim');
+            } else {
+                tr.classList.add('unreachable');
             }
         }
 
-        const url = `/stream?target=${encodeURIComponent(target)}&mode=${encodeURIComponent(mode)}&dport=${encodeURIComponent(dport)}&maxhops=${encodeURIComponent(maxhops)}&count=${encodeURIComponent(count)}&timeout=${encodeURIComponent(timeout)}`;
-        const es = new EventSource(url);
-        es.onmessage = (e) => {
-            if (!e.data) return;
-            try {
-                const msg = JSON.parse(e.data);
-                if (msg.type === 'hop') {
-                    addOrUpdateRow(msg.data);
-                } else if (msg.type === 'error') {
-                    alert('错误: ' + msg.msg);
-                } else if (msg.type === 'done') {
-                    es.close();
-                }
-            } catch (err) {console.error(err)}
-        };
-        es.onerror = () => {
-            es.close();
-        };
-    })();
+        // 每次更新后重新分析路由
+        analyzeRoute();
+    }
+
+    const url = `/stream?target=${encodeURIComponent(target)}&mode=${encodeURIComponent(mode)}&dport=${encodeURIComponent(dport)}&maxhops=${encodeURIComponent(maxhops)}&count=${encodeURIComponent(count)}&timeout=${encodeURIComponent(timeout)}`;
+    const es = new EventSource(url);
+
+    es.onmessage = (e) => {
+        if (!e.data) return;
+        try {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'hop') {
+                addOrUpdateRow(msg.data);
+            } else if (msg.type === 'error') {
+                alert('错误: ' + msg.msg);
+            } else if (msg.type === 'done') {
+                es.close();
+                analyzeRoute(); // 最终分析
+            }
+        } catch (err) {
+            console.error(err);
+        }
+    };
+
+    es.onerror = () => {
+        es.close();
+    };
+})();
 </script>
 </body>
 </html>
